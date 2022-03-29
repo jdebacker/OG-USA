@@ -96,7 +96,7 @@ def test_arctan_fit():
         first_point, coef1, coef2, coef3, abil_deprec, init_guesses
     )
 
-    assert np.allclose(test_vals, expected_vals)
+    assert np.allclose(test_vals, expected_vals, atol=1e-4, rtol=0.0)
 
 
 def test_get_e_orig():
