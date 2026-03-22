@@ -9,15 +9,24 @@ Or from the repo root with the helper script:
 """
 import os
 import pathlib
+import sys
 import time
+
+# When served with `panel serve ogusa/app/app.py`, this file is executed
+# as a script (not imported as a package), so relative imports fail.
+# Adding the repo root to sys.path makes the absolute imports below work
+# in both the panel-serve and the package-import contexts.
+_REPO_ROOT = str(pathlib.Path(__file__).parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import panel as pn
 import param
 
-from .backend.functions import MetaParams, get_inputs, get_version
-from .ui.job_manager import JobManager, _fmt_elapsed
-from .ui.parameter_form import ParameterForm
-from .ui.results_viewer import ResultsViewer, _build_results_layout
+from ogusa.app.backend.functions import MetaParams, get_inputs, get_version
+from ogusa.app.ui.job_manager import JobManager, _fmt_elapsed
+from ogusa.app.ui.parameter_form import ParameterForm
+from ogusa.app.ui.results_viewer import ResultsViewer, _build_results_layout
 
 pn.extension(
     "tabulator",

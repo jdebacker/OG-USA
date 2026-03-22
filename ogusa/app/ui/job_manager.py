@@ -19,7 +19,7 @@ from email.mime.text import MIMEText
 
 import param
 
-from ..backend.functions import run_model
+from ogusa.app.backend.functions import run_model
 
 
 # ---------------------------------------------------------------------------
