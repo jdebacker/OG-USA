@@ -4,7 +4,8 @@ OG-USA model that rely on macro data for calibration.
 """
 
 # imports
-import pandas_datareader.data as web
+from fredapi import Fred
+import os
 import pandas as pd
 import numpy as np
 import datetime
@@ -38,11 +39,23 @@ def get_macro_params():
         "Nominal GDP": "GDP",
     }
 
-    # pull series of interest using pandas_datareader
-    fred_data = web.DataReader(variable_dict.values(), "fred", start, end)
-    fred_data.rename(
-        columns=dict((y, x) for x, y in variable_dict.items()), inplace=True
-    )
+    # pull series of interest using fredapi
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "FRED_API_KEY environment variable is not set. "
+            "A free API key can be obtained at "
+            "https://fred.stlouisfed.org/docs/api/api_key.html"
+        )
+    fred = Fred(api_key=api_key)
+    series_list = []
+    for name, series_id in variable_dict.items():
+        s = fred.get_series(
+            series_id, observation_start=start, observation_end=end
+        )
+        s.name = name
+        series_list.append(s)
+    fred_data = pd.concat(series_list, axis=1)
 
     # make sure all dollar value data are in billions
     fred_data["Debt held by public"] = fred_data["Debt held by public"] / 1000
