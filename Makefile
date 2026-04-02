@@ -23,6 +23,7 @@ help:
 	@echo "pip-package: build pip package for distribution"
 	@echo "format     : format code using black"
 	@echo "documentation : build documentation using jupyter-book"
+	@echo "new-baseline : update baseline parameters and save to json file"
 
 
 .PHONY=clean
@@ -87,3 +88,6 @@ documentation:
 	jupyter-book clean docs/book
 	python docs/create_doc_figures.py
 	jupyter-book build docs/book
+
+new-baseline:
+	python ogusa/update_baseline.py
