@@ -1,9 +1,6 @@
 import os
-import numpy as np
-import math
 import pytest
 from ogusa import psid_data_setup
-from ogusa.constants import PSID_NOMINAL_VARS, PSID_CONSTANT_VARS
 
 CUR_PATH = os.path.abspath(os.path.dirname(__file__))
 

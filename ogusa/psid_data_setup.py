@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
-import pickle
-from pandas_datareader import data as web
+from fredapi import Fred
 import datetime
 from linearmodels import PanelOLS
 from ogusa.constants import PSID_NOMINAL_VARS, PSID_CONSTANT_VARS
@@ -121,8 +120,10 @@ def prep_data(
     # set beginning and end dates for data
     start = datetime.datetime(1968, 1, 1)
     end = datetime.datetime.today()
-    # pull series of interest using pandas_datareader
-    fred_data = web.DataReader(["CPIAUCSL"], "fred", start, end)
+    # pull series of interest using fredapi
+    fred = Fred()
+    fred_data = fred.get_series("CPIAUCSL", start, end)
+    fred_data = fred_data.to_frame(name="CPIAUCSL")
     # Make data annual by averaging over months in year
     fred_data = fred_data.resample("YE").mean()
     fred_data["year_data"] = fred_data.index.year
