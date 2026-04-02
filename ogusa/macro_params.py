@@ -21,7 +21,7 @@ def get_macro_params():
     # format is year (1940),month (1),day (1)
     start = datetime.datetime(1947, 1, 1)
     end = datetime.date.today()  # go through today
-    baseline_date = datetime.datetime(2023, 3, 31)
+    baseline_date = datetime.datetime(2025, 12, 31)
 
     variable_dict = {
         "GDP Per Capita": "A939RX0Q048SBEA",
