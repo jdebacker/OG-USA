@@ -18,6 +18,7 @@ class Calibration:
         estimate_beta=False,
         estimate_chi_n=False,
         estimate_pop=False,
+        get_macro_params=False,
         tax_func_path=None,
         iit_baseline=None,
         iit_reform={},
@@ -41,6 +42,7 @@ class Calibration:
             estimate_beta (bool): whether to estimate beta
             estimate_chi_n (bool): whether to estimate chi_n
             estimate_pop (bool): whether to estimate population
+            get_macro_params (bool): whether to get macro parameters
             tax_func_path (str): path to tax function parameters
             iit_baseline (dict): baseline policy to use
             iit_reform (dict): reform tax parameters
@@ -67,6 +69,7 @@ class Calibration:
         self.estimate_beta = estimate_beta
         self.estimate_chi_n = estimate_chi_n
         self.estimate_pop = estimate_pop
+        self.get_macro_params = get_macro_params
         if estimate_tax_functions:
             if tax_func_path is not None:
                 run_micro = False
@@ -92,7 +95,8 @@ class Calibration:
         #     chi_n = self.get_chi_n()
 
         # Macro estimation
-        self.macro_params = macro_params.get_macro_params()
+        if self.get_macro_params:
+            self.macro_params = macro_params.get_macro_params()
 
         # eta estimation
         self.eta = transfer_distribution.get_transfer_matrix(
@@ -408,7 +412,8 @@ class Calibration:
             dict["chi_n"] = self.chi_n
         dict["eta"] = self.eta
         dict["zeta"] = self.zeta
-        dict.update(self.macro_params)
+        if self.get_macro_params:
+            dict.update(self.macro_params)
         dict["e"] = self.e
         if self.estimate_pop:
             dict.update(self.demographic_params)
