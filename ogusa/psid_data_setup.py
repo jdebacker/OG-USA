@@ -121,7 +121,14 @@ def prep_data(
     start = datetime.datetime(1968, 1, 1)
     end = datetime.datetime.today()
     # pull series of interest using fredapi
-    fred = Fred()
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "FRED_API_KEY environment variable is not set. "
+            "A free API key can be obtained at "
+            "https://fred.stlouisfed.org/docs/api/api_key.html"
+        )
+    fred = Fred(api_key=api_key)
     fred_data = fred.get_series("CPIAUCSL", start, end)
     fred_data = fred_data.to_frame(name="CPIAUCSL")
     # Make data annual by averaging over months in year

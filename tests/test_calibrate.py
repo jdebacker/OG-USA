@@ -48,3 +48,31 @@ def test_get_dict():
     c_dict = c.get_dict()
 
     assert isinstance(c_dict, dict)
+
+
+@pytest.mark.needs_fred
+def test_get_macro_params():
+    p = ogcore.Specifications()
+    c = Calibration(p, get_macro_params=True)
+    c_dict = c.get_dict()
+
+    assert isinstance(c_dict, dict)
+
+
+def test_get_pop():
+    p = ogcore.Specifications()
+    c = Calibration(p, estimate_pop=True)
+    c_dict = c.get_dict()
+
+    assert isinstance(c_dict, dict)
+
+
+@pytest.mark.local_only  # this test is slow
+def test_estimate_taxes():
+    p = ogcore.Specifications()
+    p.tax_func_type = "HSV"
+    p.age_specific = False
+    c = Calibration(p, estimate_tax_functions=True)
+    c_dict = c.get_dict()
+
+    assert isinstance(c_dict, dict)

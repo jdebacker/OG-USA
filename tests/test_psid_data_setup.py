@@ -5,6 +5,7 @@ from ogusa import psid_data_setup
 CUR_PATH = os.path.abspath(os.path.dirname(__file__))
 
 
+@pytest.mark.needs_fred
 def test_prep_data():
     """
     Test that function works
@@ -12,6 +13,7 @@ def test_prep_data():
     _ = psid_data_setup.prep_data()
 
 
+@pytest.mark.needs_fred
 @pytest.mark.local
 def test_num_obs_total():
     """
@@ -26,7 +28,7 @@ def test_num_obs_total():
         print("Obs in final panel = ", panel_li.shape[0])
         assert False
 
-
+@pytest.mark.needs_fred
 @pytest.mark.local
 def test_indicator_vars():
     """

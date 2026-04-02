@@ -1,6 +1,8 @@
+import pytest
 from ogusa.macro_params import get_macro_params
 
 
+@pytest.mark.needs_fred
 def test_get_macro_params_no_missing_values():
     """
     Test that get_macro_params returns a dictionary with no None or
