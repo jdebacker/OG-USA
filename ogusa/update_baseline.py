@@ -17,11 +17,6 @@ def main():
     # Directories to save data
     CUR_DIR = os.path.dirname(os.path.realpath(__file__))
 
-    """
-    ---------------------------------------------------------------------------
-    Run baseline policy
-    ---------------------------------------------------------------------------
-    """
     # Set up baseline parameterization
     p = Specifications(
         baseline=True,
@@ -36,6 +31,21 @@ def main():
     c = Calibration(
         p, estimate_tax_functions=True, estimate_pop=True, client=client
     )
-    p.update_specifications(c.get_dict())
+    d = c.get_dict()
+    # update format, keys for some params
+    d["g_y_annual"] = d.pop("g_y")
+    d["gamma"] = [d["gamma"]]
+    d["alpha_T"] = [d["alpha_T"]]
+    d["alpha_G"] = [d["alpha_G"]]
+    d["alpha_I"] = [d["alpha_I"]]
+    d["r_gov_scale"] = [d["r_gov_scale"]]
+    d["r_gov_shift"] = [d["r_gov_shift"]]
+    d.pop('taxcalc_version', None)
+    # update parameters
+    p.update_specifications(d)
     # save to json file
     params_to_json(p, os.path.join(CUR_DIR, "ogusa_default_parameters.json"))
+
+
+if __name__ == "__main__":
+    main()
