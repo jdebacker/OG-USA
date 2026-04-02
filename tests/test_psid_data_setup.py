@@ -28,6 +28,7 @@ def test_num_obs_total():
         print("Obs in final panel = ", panel_li.shape[0])
         assert False
 
+
 @pytest.mark.needs_fred
 @pytest.mark.local
 def test_indicator_vars():
