@@ -8,17 +8,16 @@ import numpy as np
 import matplotlib.pyplot as plt
 import importlib
 import json
-import ogcore
 from ogcore.parameters import Specifications
 from ogcore import parameter_plots as pp
+from ogcore import parameter_tables as pt
 from ogcore import demographics as demog
-import ogusa
 
 
 CUR_DIR = os.path.dirname(os.path.realpath(__file__))
 UN_COUNTRY_CODE = "840"
 plot_path = os.path.join(CUR_DIR, "book", "content", "calibration", "images")
-YEAR_TO_PLOT = 2025
+
 # update path for demographics graphdiag plots
 demog.OUTPUT_DIR = plot_path
 
@@ -33,9 +32,8 @@ with importlib.resources.open_text(
     "ogusa", "ogusa_default_parameters.json"
 ) as file:
     defaults = json.load(file)
-p.start_year = YEAR_TO_PLOT
 p.update_specifications(defaults)
-
+YEAR_TO_PLOT = int(p.start_year)
 """
 Demographics chapter
 """
@@ -101,7 +99,6 @@ demog.get_pop_objs(
     imm_rates=None,
     infer_pop=False,
     pop_dist=None,
-    pre_pop_dist=None,
     country_id=UN_COUNTRY_CODE,
     initial_data_year=YEAR_TO_PLOT - 1,
     final_data_year=YEAR_TO_PLOT + 2,
@@ -154,9 +151,6 @@ pp.plot_ability_profiles(
 """
 Create table for exogenous parameters
 """
-import ogcore.parameter_tables as pt
-from ogcore import Specifications
-
 table = pt.param_table(
     p,
     table_format="md",
