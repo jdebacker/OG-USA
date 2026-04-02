@@ -7,7 +7,6 @@ import datetime
 from linearmodels import PanelOLS
 from ogusa.constants import PSID_NOMINAL_VARS, PSID_CONSTANT_VARS
 
-
 try:
     # This is the case when a separate script is calling this function in
     # this module

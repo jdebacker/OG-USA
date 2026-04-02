@@ -4,7 +4,6 @@ import pickle
 import os
 from constants import CODE_PATH
 
-
 # Create directory if output directory does not already exist
 cur_path = os.path.split(os.path.abspath(__file__))[0]
 output_fldr = "csv_output_files"

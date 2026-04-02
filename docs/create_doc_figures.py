@@ -13,7 +13,6 @@ from ogcore import parameter_plots as pp
 from ogcore import parameter_tables as pt
 from ogcore import demographics as demog
 
-
 CUR_DIR = os.path.dirname(os.path.realpath(__file__))
 UN_COUNTRY_CODE = "840"
 plot_path = os.path.join(CUR_DIR, "book", "content", "calibration", "images")
@@ -126,7 +125,9 @@ def main():
     )
     plt.xlabel(r"Model Period ($t$)")
     plt.ylabel(r"Population Growth Rate ($g_{n,t}$)")
-    plt.savefig(os.path.join(plot_path, "population_growth_rates.png"), dpi=300)
+    plt.savefig(
+        os.path.join(plot_path, "population_growth_rates.png"), dpi=300
+    )
 
     # Population distribution at different points in time
     pp.plot_population(

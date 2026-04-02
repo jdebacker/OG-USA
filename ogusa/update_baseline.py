@@ -40,7 +40,7 @@ def main():
     d["alpha_I"] = [d["alpha_I"]]
     d["r_gov_scale"] = [d["r_gov_scale"]]
     d["r_gov_shift"] = [d["r_gov_shift"]]
-    d.pop('taxcalc_version', None)
+    d.pop("taxcalc_version", None)
     # update parameters
     p.update_specifications(d)
     # save to json file

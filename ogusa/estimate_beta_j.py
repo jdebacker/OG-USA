@@ -11,7 +11,6 @@ from ogusa import wealth
 from ogcore import SS
 from ogcore.utils import Inequality
 
-
 # Don't print output along the way of SS solution
 SS.VERBOSE = False
 
