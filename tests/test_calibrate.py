@@ -72,7 +72,7 @@ def test_get_pop():
 def test_estimate_taxes():
     p = ogcore.Specifications()
     p.tax_func_type = "HSV"
-    p.age_specific = False
+    p.age_specific = True
     c = Calibration(p, estimate_tax_functions=True)
     c_dict = c.get_dict()
 
