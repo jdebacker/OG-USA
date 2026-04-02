@@ -59,6 +59,7 @@ def test_get_macro_params():
     assert isinstance(c_dict, dict)
 
 
+@pytest.mark.local_only  # this test requires api access
 def test_get_pop():
     p = ogcore.Specifications()
     c = Calibration(p, estimate_pop=True)
@@ -67,7 +68,7 @@ def test_get_pop():
     assert isinstance(c_dict, dict)
 
 
-@pytest.mark.local_only  # this test is slow
+@pytest.mark.local_only  # this test is slow and requires a lot of memory, so we mark it as local only
 def test_estimate_taxes():
     p = ogcore.Specifications()
     p.tax_func_type = "HSV"
