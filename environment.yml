@@ -37,5 +37,6 @@ dependencies:
   - cs-kit
   - cs2tc
   - fredapi
+  - tabulate
   - ogcore
   - taxcalc>=5.2.0
