@@ -29,7 +29,11 @@ def main():
         defaults = json.load(file)
     p.update_specifications(defaults)
     c = Calibration(
-        p, estimate_tax_functions=True, estimate_pop=True, client=client
+        p,
+        estimate_tax_functions=True,
+        estimate_pop=True,
+        get_macro_params=True,
+        client=client,
     )
     d = c.get_dict()
     # update format, keys for some params
