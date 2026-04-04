@@ -1,7 +1,9 @@
+import pytest
 from ogusa.utils import read_cbo_forecast
 import numpy as np
 
 
+@pytest.mark.local
 def test_read_cbo_forecast():
     """
     Test that CBO data read as expected.

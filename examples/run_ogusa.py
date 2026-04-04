@@ -5,8 +5,6 @@ import json
 import time
 import importlib.resources
 import copy
-from pathlib import Path
-from taxcalc import Calculator
 import matplotlib.pyplot as plt
 from ogusa.calibrate import Calibration
 from ogcore.parameters import Specifications

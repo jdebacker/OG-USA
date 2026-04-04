@@ -13,7 +13,6 @@ from ogcore import output_plots as op
 from ogcore.execute import runner
 from ogcore.utils import safe_read_pickle
 
-
 # Use a custom matplotlib style file for plots
 style_file_url = (
     "https://raw.githubusercontent.com/PSLmodels/OG-Core/"

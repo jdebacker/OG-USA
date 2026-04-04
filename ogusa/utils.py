@@ -1,3 +1,4 @@
+import io
 import pandas as pd
 import numpy as np
 from scipy.stats import gaussian_kde
@@ -5,6 +6,29 @@ import matplotlib.pyplot as plt
 import requests
 import urllib3
 import ssl
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.cbo.gov/",
+}
+
+
+def _fetch_excel(url):
+    """Download a CBO Excel file using a session to acquire cookies first."""
+    session = requests.Session()
+    session.get("https://www.cbo.gov/", headers=_HEADERS, timeout=30)
+    response = session.get(url, headers=_HEADERS, timeout=30)
+    response.raise_for_status()
+    return io.BytesIO(response.content)
 
 
 def read_cbo_forecast(
@@ -44,7 +68,7 @@ def read_cbo_forecast(
     # Econ data in levels
     # Read in data
     df = pd.read_excel(
-        lt_econ_url,
+        _fetch_excel(lt_econ_url),
         sheet_name="3. Econ Vars_Annual Levels",
         skiprows=6,
         nrows=62,
@@ -59,7 +83,7 @@ def read_cbo_forecast(
     # Econ data in rates
     # Read in data
     df = pd.read_excel(
-        lt_econ_url,
+        _fetch_excel(lt_econ_url),
         sheet_name="1. Econ Vars_Annual Rates",
         skiprows=7,
         nrows=39,
@@ -88,7 +112,7 @@ def read_cbo_forecast(
 
     # add debt forecast
     df_fiscal = pd.read_excel(
-        lt_budget_url,  # Need to define this variable in args or at the top
+        _fetch_excel(lt_budget_url),
         sheet_name="1. Summary Ext Baseline",
         skiprows=9,
         nrows=32,
@@ -117,7 +141,10 @@ def read_cbo_forecast(
     # %%
     #  10 year budget
     df = pd.read_excel(
-        ten_year_budget_url, sheet_name="Table B-1", skiprows=7, nrows=7
+        _fetch_excel(ten_year_budget_url),
+        sheet_name="Table B-1",
+        skiprows=7,
+        nrows=7,
     )
     df.rename(
         columns={
@@ -143,7 +170,10 @@ def read_cbo_forecast(
     ]
     # data from other table
     df = pd.read_excel(
-        ten_year_budget_url, sheet_name="Table B-4", skiprows=8, nrows=18
+        _fetch_excel(ten_year_budget_url),
+        sheet_name="Table B-4",
+        skiprows=8,
+        nrows=18,
     )
     df.rename(
         columns={
@@ -166,7 +196,7 @@ def read_cbo_forecast(
     # %%
     # 10 year macro forecast
     df = pd.read_excel(
-        ten_year_macro_url,
+        _fetch_excel(ten_year_macro_url),
         sheet_name="2. Calendar Year",
         skiprows=6,
         nrows=131,

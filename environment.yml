@@ -14,13 +14,12 @@ dependencies:
 - dask-core>=2.30.0
 - distributed>=2.30.1
 - paramtools>=0.20.0
-# - taxcalc==5.2.0
 - ipython
 - ipykernel
 - jupyter
 - sphinx>=3.5.4
 - sphinx-book-theme>=0.1.3
-- jupyter-book>=0.11.3
+- jupyter-book<2.0.0
 - pytest>=6.0
 - pytest-cov
 - pytest-xdist
@@ -36,6 +35,7 @@ dependencies:
   - openpyxl>=3.1.2
   - cs-kit
   - cs2tc
-  - pandas-datareader
+  - fredapi
+  - tabulate
   - ogcore
   - taxcalc>=5.2.0

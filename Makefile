@@ -3,15 +3,16 @@
 # Development is typically conducted on Linux or Max OS X (with the Xcode
 #              command-line tools installed), so this Makefile is designed
 #              to work in that environment (and not on Windows).
-# USAGE: OG-Core$ make [TARGET]
+# USAGE: OG-USA$ make [TARGET]
 
 .PHONY=help
 help:
 	@echo "USAGE: make [TARGET]"
 	@echo "TARGETS:"
 	@echo "help       : show help message"
-	@echo "clean      : remove .pyc files and local ccc package"
-	@echo "package    : build and install local package"
+	@echo "clean      : remove .pyc files and local ogusa package"
+	@echo "install    : build and install local package"
+	@echo "test       : run tests with coverage"
 	@echo "pytest     : generate report for and cleanup after"
 	@echo "             pytest -W ignore -m ''"
 	@echo "cstest     : generate coding-style errors using the"
@@ -19,18 +20,29 @@ help:
 	@echo "coverage   : generate test coverage report"
 	@echo "git-sync   : synchronize local, origin, and upstream Git repos"
 	@echo "git-pr N=n : create local pr-n branch containing upstream PR"
+	@echo "pip-package: build pip package for distribution"
+	@echo "format     : format code using black"
+	@echo "documentation : build documentation using jupyter-book"
+	@echo "new-baseline : update baseline parameters and save to json file"
+
 
 .PHONY=clean
 clean:
 	@find . -name *pyc -exec rm {} \;
 	@find . -name *cache -maxdepth 1 -exec rm -r {} \;
-	@conda uninstall ccc --yes --quiet 2>&1 > /dev/null
+	@conda uninstall ogusa --yes --quiet 2>&1 > /dev/null
+
+install:
+	pip install -e .
+
+test:
+	pytest -m 'not local' --cov=./ --cov-report=xml
 
 .PHONY=pytest
 pytest:
 	@cd ogusa ; pytest -W ignore
 
-ogcore_JSON_FILES := $(shell ls -l ./ogusa/*json | awk '{print $$9}')
+ogusa_JSON_FILES := $(shell ls -l ./ogusa/*json | awk '{print $$9}')
 
 .PHONY=cstest
 cstest:
@@ -71,3 +83,11 @@ pip-package:
 
 format:
 	black . -l 79
+
+documentation:
+	jupyter-book clean docs/book
+	python docs/create_doc_figures.py
+	jupyter-book build docs/book
+
+new-baseline:
+	python ogusa/update_baseline.py
