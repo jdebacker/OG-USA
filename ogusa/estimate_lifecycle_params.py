@@ -24,7 +24,7 @@ SS.VERBOSE = False
 
 WeightingMethod = Literal["identity", "diagonal", "optimal"]
 TailMethod = Literal["scaled_default", "flat"]
-WealthProfileMoment = Literal["level", "mean_normalized"]
+WealthProfileMoment = Literal["anchor_window", "level", "mean_normalized"]
 WEALTH_MOMENT_BIN_WEIGHTS = np.array(
     [0.25, 0.25, 0.20, 0.10, 0.10, 0.09, 0.01]
 )
@@ -35,17 +35,22 @@ class LifecycleCalibrationConfig:
     """
     Configuration for the joint lifecycle preference calibration.
 
-    The default age window is 20 through 79.  That gives 60 chi_n parameters
-    and 60 labor and wealth-profile moments, matching the intended 80
-    parameters and 130 moments when J=10.
+    The default labor age window is 20 through 79.  Wealth-profile moments
+    use ages 21 through 79 and are normalized by the mean wealth level from
+    ages 20 through 24.  That gives 80 parameters and 129 default moments
+    when J=10.
     """
 
     min_age: int = 20
     max_age: int = 79
+    wealth_profile_min_age: int = 21
+    wealth_profile_max_age: int = 79
+    wealth_anchor_min_age: int = 20
+    wealth_anchor_max_age: int = 24
     estimate_chi_n_min_age: int = 20
     estimate_chi_n_max_age: int = 79
     chi_n_tail_method: TailMethod = "scaled_default"
-    wealth_profile_moment: WealthProfileMoment = "mean_normalized"
+    wealth_profile_moment: WealthProfileMoment = "anchor_window"
     include_labor_profile: bool = True
     include_wealth_profile: bool = True
     include_income_gini: bool = True
@@ -67,8 +72,23 @@ class LifecycleCalibrationConfig:
 
     @property
     def moment_ages(self) -> np.ndarray:
-        """Return the model-age labels used in age-profile moments."""
+        """Return age labels used in labor-profile moments."""
         return np.arange(self.min_age, self.max_age + 1)
+
+    @property
+    def wealth_profile_ages(self) -> np.ndarray:
+        """Return age labels used in wealth-profile moments."""
+        return np.arange(
+            self.wealth_profile_min_age,
+            self.wealth_profile_max_age + 1,
+        )
+
+    @property
+    def wealth_anchor_ages(self) -> np.ndarray:
+        """Return age labels used to normalize wealth-profile moments."""
+        return np.arange(
+            self.wealth_anchor_min_age, self.wealth_anchor_max_age + 1
+        )
 
     @property
     def estimated_chi_n_ages(self) -> np.ndarray:
@@ -86,7 +106,12 @@ class LifecycleCalibrationConfig:
         min_model_age = int(model_ages[0])
         max_model_age = int(model_ages[-1])
         requested_ages = np.concatenate(
-            [self.moment_ages, self.estimated_chi_n_ages]
+            [
+                self.moment_ages,
+                self.wealth_profile_ages,
+                self.wealth_anchor_ages,
+                self.estimated_chi_n_ages,
+            ]
         )
         if requested_ages.min() < min_model_age:
             raise ValueError("Requested ages start before model ages.")
@@ -98,6 +123,12 @@ class LifecycleCalibrationConfig:
             )
         if self.max_age < self.min_age:
             raise ValueError("max_age must be at least min_age.")
+        if self.wealth_profile_max_age < self.wealth_profile_min_age:
+            raise ValueError(
+                "wealth_profile_max_age must be at least min age."
+            )
+        if self.wealth_anchor_max_age < self.wealth_anchor_min_age:
+            raise ValueError("wealth_anchor_max_age must be at least min age.")
 
 
 @dataclass(frozen=True)
@@ -219,6 +250,7 @@ def _require_finite(values: np.ndarray, label: str) -> np.ndarray:
 
 def _normalize_wealth_profile(
     profile: np.ndarray,
+    anchor_profile: np.ndarray,
     method: WealthProfileMoment,
 ) -> np.ndarray:
     """Scale a wealth age profile according to the requested convention."""
@@ -230,6 +262,13 @@ def _normalize_wealth_profile(
         if not np.isfinite(mean) or np.isclose(mean, 0.0):
             raise ValueError("Cannot normalize wealth profile with zero mean.")
         return profile / mean
+    if method == "anchor_window":
+        anchor_mean = np.nanmean(np.asarray(anchor_profile, dtype=float))
+        if not np.isfinite(anchor_mean) or np.isclose(anchor_mean, 0.0):
+            raise ValueError(
+                "Cannot normalize wealth profile with zero anchor mean."
+            )
+        return profile / anchor_mean
     raise ValueError(f"Unsupported wealth profile moment: {method}")
 
 
@@ -314,7 +353,7 @@ def labor_profile_from_cps(
         weight_col,
         config.moment_ages,
     )
-    labor = hours / ((24 - 8) * 7)
+    labor = hours / ((24 - 8) * 7)  # scale so fraction of time endowment
     return _require_finite(labor, "labor profile")
 
 
@@ -327,10 +366,17 @@ def wealth_profile_from_scf(
         scf,
         "networth_infadj",
         "wgt",
-        config.moment_ages,
+        config.wealth_profile_ages,
+    )
+    anchor_profile = _weighted_mean_by_age(
+        scf,
+        "networth_infadj",
+        "wgt",
+        config.wealth_anchor_ages,
     )
     profile = _normalize_wealth_profile(
         profile,
+        anchor_profile,
         config.wealth_profile_moment,
     )
     return _require_finite(profile, "wealth profile")
@@ -429,7 +475,9 @@ def compute_data_moments(
         if scf is None:
             scf = load_scf_wealth_data(config)
         wealth_profile = wealth_profile_from_scf(scf, config)
-        names.extend(f"net_wealth_age_{age}" for age in config.moment_ages)
+        names.extend(
+            f"net_wealth_age_{age}" for age in config.wealth_profile_ages
+        )
         values.extend(wealth_profile)
 
     if config.include_income_gini:
@@ -468,28 +516,36 @@ def compute_model_moments(
     if config is None:
         config = LifecycleCalibrationConfig()
     config.validate(p)
-    age_idx = _age_indices(config.moment_ages, p)
     lambdas = _lambdas(p)
     names: list[str] = []
     values: list[float] = []
 
     if config.include_labor_profile:
+        age_idx = _age_indices(config.moment_ages, p)
         n = np.asarray(ss_output["n"], dtype=float)
         labor = (n[age_idx, :] * lambdas.reshape(1, p.J)).sum(axis=1)
         names.extend(f"labor_supply_age_{age}" for age in config.moment_ages)
         values.extend(labor)
 
     if config.include_wealth_profile:
+        wealth_age_idx = _age_indices(config.wealth_profile_ages, p)
+        anchor_age_idx = _age_indices(config.wealth_anchor_ages, p)
         b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
         factor = float(ss_output.get("factor", 1.0))
         wealth_profile = (
-            b_sp1[age_idx, :] * factor * lambdas.reshape(1, p.J)
+            b_sp1[wealth_age_idx, :] * factor * lambdas.reshape(1, p.J)
+        ).sum(axis=1)
+        anchor_profile = (
+            b_sp1[anchor_age_idx, :] * factor * lambdas.reshape(1, p.J)
         ).sum(axis=1)
         wealth_profile = _normalize_wealth_profile(
             wealth_profile,
+            anchor_profile,
             config.wealth_profile_moment,
         )
-        names.extend(f"net_wealth_age_{age}" for age in config.moment_ages)
+        names.extend(
+            f"net_wealth_age_{age}" for age in config.wealth_profile_ages
+        )
         values.extend(wealth_profile)
 
     if config.include_income_gini:
