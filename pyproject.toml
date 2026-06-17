@@ -119,3 +119,8 @@ markers = [
     "needs_tmd: marks tests that require the TMD data to run",
     "needs_fred: marks tests that require a FRED API key to run",
 ]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
