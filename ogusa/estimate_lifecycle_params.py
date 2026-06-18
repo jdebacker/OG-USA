@@ -69,6 +69,7 @@ class LifecycleCalibrationConfig:
     optimizer_options: dict = field(
         default_factory=lambda: {"maxiter": 100, "maxfun": 250}
     )
+    use_ss_solver_restart: bool = True
 
     @property
     def moment_ages(self) -> np.ndarray:
@@ -166,6 +167,18 @@ class LifecycleCalibrationResult:
             "chi_b": self.chi_b.tolist(),
             "chi_n": self.chi_n.tolist(),
         }
+
+
+@dataclass
+class SSSolutionCache:
+    """Mutable cache for warm-starting repeated SS solves."""
+
+    previous_output: dict | None = None
+    use_ss_solver: bool = True
+
+    def reset(self) -> None:
+        """Clear the cached SS output."""
+        self.previous_output = None
 
 
 def _as_vector(values) -> np.ndarray:
@@ -720,6 +733,63 @@ def apply_lifecycle_params(
     )
 
 
+def solve_ss_with_cache(
+    p,
+    client=None,
+    ss_cache: SSSolutionCache | None = None,
+) -> dict:
+    """
+    Solve SS, optionally warm-starting from the previous SS output.
+
+    The direct SS_solver path keeps p.baseline unchanged, so baseline solves
+    still update the model scaling factor.  If the warm start fails, fall back
+    to SS.run_SS and refresh the cache with that solution.
+    """
+    use_cache = (
+        ss_cache is not None
+        and ss_cache.use_ss_solver
+        and ss_cache.previous_output is not None
+    )
+    if use_cache:
+        previous = ss_cache.previous_output
+        try:
+            ig_baseline = (
+                previous.get("I_g")
+                if getattr(p, "baseline_spending", False)
+                else None
+            )
+            ss_output = SS.SS_solver(
+                previous["b_sp1"],
+                previous["n"],
+                float(previous["r_p"]),
+                float(previous["r"]),
+                float(previous["w"]),
+                previous["p_m"],
+                float(previous["Y"]),
+                previous["BQ"],
+                float(previous["TR"]),
+                ig_baseline,
+                float(previous["factor"]),
+                p,
+                client,
+            )
+        except (
+            AssertionError,
+            FloatingPointError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            ss_output = SS.run_SS(p, client=client)
+    else:
+        ss_output = SS.run_SS(p, client=client)
+
+    if ss_cache is not None:
+        ss_cache.previous_output = ss_output
+    return ss_output
+
+
 def weighting_matrix(
     moment_count: int,
     method: WeightingMethod = "identity",
@@ -822,6 +892,7 @@ def smm_objective(
     base_chi_n: np.ndarray | None = None,
     client=None,
     transform: bool = True,
+    ss_cache: SSSolutionCache | None = None,
 ) -> float:
     """Evaluate the joint lifecycle SMM objective."""
     if config is None:
@@ -842,7 +913,7 @@ def smm_objective(
             params["chi_b"],
             params["chi_n"],
         )
-        ss_output = SS.run_SS(p, client=client)
+        ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
         model_moments = compute_model_moments(ss_output, p, config)
         distance = smm_distance(model_moments, data_moments, W)
     except (
@@ -884,11 +955,21 @@ def estimate_lifecycle_params(
             bootstrap_moments=bootstrap_moments,
             ridge=config.weighting_ridge,
         )
+    ss_cache = SSSolutionCache(use_ss_solver=config.use_ss_solver_restart)
 
     est_output = opt.minimize(
         smm_objective,
         theta0,
-        args=(data_moments, W, p, config, base_chi_n, client, transform),
+        args=(
+            data_moments,
+            W,
+            p,
+            config,
+            base_chi_n,
+            client,
+            transform,
+            ss_cache,
+        ),
         method=config.optimizer_method,
         tol=config.optimizer_tol,
         options=config.optimizer_options,
@@ -906,7 +987,7 @@ def estimate_lifecycle_params(
         params["chi_b"],
         params["chi_n"],
     )
-    ss_output = SS.run_SS(p, client=client)
+    ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
     model_moments = compute_model_moments(ss_output, p, config)
 
     return LifecycleCalibrationResult(
@@ -936,6 +1017,7 @@ def compute_parameter_vcv(
         config = LifecycleCalibrationConfig()
     if base_chi_n is None:
         base_chi_n = _ss_chi_n(p)
+    ss_cache = SSSolutionCache(use_ss_solver=config.use_ss_solver_restart)
     theta_hat = _as_vector(theta_hat)
     params = unpack_lifecycle_params(
         theta_hat,
@@ -950,7 +1032,7 @@ def compute_parameter_vcv(
         params["chi_b"],
         params["chi_n"],
     )
-    ss_output = SS.run_SS(p, client=client)
+    ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
     base_moments = compute_model_moments(ss_output, p, config)
     deriv = np.zeros((base_moments.values.size, theta_hat.size))
 
@@ -974,7 +1056,7 @@ def compute_parameter_vcv(
             high_params["chi_b"],
             high_params["chi_n"],
         )
-        high_output = SS.run_SS(p, client=client)
+        high_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
         high_moments = compute_model_moments(high_output, p, config)
 
         low_params = unpack_lifecycle_params(
@@ -990,7 +1072,7 @@ def compute_parameter_vcv(
             low_params["chi_b"],
             low_params["chi_n"],
         )
-        low_output = SS.run_SS(p, client=client)
+        low_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
         low_moments = compute_model_moments(low_output, p, config)
         deriv[:, i] = (high_moments.values - low_moments.values) / (2 * step)
 
