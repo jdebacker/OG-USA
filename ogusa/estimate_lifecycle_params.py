@@ -9,25 +9,30 @@ values into the standard OG-USA calibration flow after validating the fit.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 import scipy.optimize as opt
+import ogcore
 from ogcore import SS
 from ogcore.utils import Inequality
 
 from ogusa import compute_moments, wealth
 
-SS.VERBOSE = False
+ogcore.config.VERBOSE = False
+logger = logging.getLogger(__name__)
 
 WeightingMethod = Literal["identity", "diagonal", "optimal"]
 TailMethod = Literal["scaled_default", "flat"]
 WealthProfileMoment = Literal["anchor_window", "level", "mean_normalized"]
+MomentDistanceMethod = Literal["absolute", "relative"]
 WEALTH_MOMENT_BIN_WEIGHTS = np.array(
     [0.25, 0.25, 0.20, 0.10, 0.10, 0.09, 0.01]
 )
+SAVINGS_RATE_DATA_LABEL = r"Gross savings rate $(S/Y)$"
 
 
 @dataclass(frozen=True)
@@ -37,8 +42,10 @@ class LifecycleCalibrationConfig:
 
     The default labor age window is 20 through 79.  Wealth-profile moments
     use ages 21 through 79 and are normalized by the mean wealth level from
-    ages 20 through 24.  That gives 80 parameters and 129 default moments
-    when J=10.
+    ages 20 through 24.  chi_n is parameterized as a cubic B-spline in log
+    space over all model ages, with chi_n_n_spline_knots basis functions.
+    That gives 2*J + chi_n_n_spline_knots parameters and ~130 default
+    moments when J=10 and chi_n_n_spline_knots=10 (30 parameters total).
     """
 
     min_age: int = 20
@@ -54,8 +61,10 @@ class LifecycleCalibrationConfig:
     include_labor_profile: bool = True
     include_wealth_profile: bool = True
     include_income_gini: bool = True
+    include_savings_rate: bool = True
     include_wealth_distribution: bool = True
     include_inheritance_moments: bool = False
+    macro_year: int = 2025
     cps_years: tuple[int, ...] = (2023, 2022)
     scf_yrs_list: tuple[int, ...] = (2019,)
     cps_directory: str | None = None
@@ -67,9 +76,14 @@ class LifecycleCalibrationConfig:
     optimizer_method: str = "L-BFGS-B"
     optimizer_tol: float = 1e-10
     optimizer_options: dict = field(
-        default_factory=lambda: {"maxiter": 100, "maxfun": 250}
+        default_factory=lambda: {"maxiter": 100, "maxfun": 500}
     )
+    chi_n_n_spline_knots: int = 10
+    chi_n_spline_degree: int = 3
+    moment_distance_method: MomentDistanceMethod = "relative"
+    moment_distance_floor: float = 1e-8
     use_ss_solver_restart: bool = True
+    log_optimizer_progress: bool = True
 
     @property
     def moment_ages(self) -> np.ndarray:
@@ -207,6 +221,58 @@ def _age_to_index(age: int, p) -> int:
 def _age_indices(ages: np.ndarray, p) -> np.ndarray:
     """Map age labels to model indices."""
     return np.array([_age_to_index(age, p) for age in ages], dtype=int)
+
+
+def _build_chi_n_spline_basis(
+    ages: np.ndarray,
+    n_basis: int,
+    degree: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a B-spline design matrix for the chi_n age profile.
+
+    The spline is defined in log space: evaluating ``B @ gamma`` gives
+    ``log(chi_n)`` at each age, so ``chi_n = exp(B @ gamma)`` is always
+    positive regardless of the coefficient values.
+
+    Args:
+        ages: Age values at which to evaluate the basis (length N).
+        n_basis: Number of B-spline basis functions (= number of free
+            coefficients).  Must satisfy n_basis >= degree + 1.
+        degree: Polynomial degree of the spline (default 3 = cubic).
+
+    Returns:
+        B: Design matrix of shape (N, n_basis).
+        knots: Full knot vector used to construct the basis.
+    """
+    from scipy.interpolate import BSpline
+
+    ages_f = np.asarray(ages, dtype=float)
+    age_min, age_max = ages_f[0], ages_f[-1]
+    n_internal = n_basis - degree - 1
+    if n_internal < 0:
+        raise ValueError(
+            f"n_basis={n_basis} is too small for degree={degree}. "
+            f"Need n_basis >= degree + 1 = {degree + 1}."
+        )
+    internal = (
+        np.linspace(age_min, age_max, n_internal + 2)[1:-1]
+        if n_internal > 0
+        else np.array([], dtype=float)
+    )
+    knots = np.concatenate(
+        [
+            np.repeat(age_min, degree + 1),
+            internal,
+            np.repeat(age_max, degree + 1),
+        ]
+    )
+    n_cols = len(knots) - degree - 1
+    B = np.zeros((len(ages_f), n_cols))
+    for i in range(n_cols):
+        c = np.zeros(n_cols)
+        c[i] = 1.0
+        B[:, i] = BSpline(knots, c, degree)(ages_f)
+    return B, knots
 
 
 def _weighted_mean(values, weights) -> float:
@@ -403,6 +469,24 @@ def income_gini_data_moment(
     return float(moments["Gini coefficient, income"])
 
 
+def savings_rate_data_moment(macro_year: int = 2025) -> float:
+    """Compute the aggregate savings-rate data moment."""
+    moments = compute_moments.get_macro_moments(year=macro_year)
+    return float(moments[SAVINGS_RATE_DATA_LABEL])
+
+
+def model_savings_rate_moment(ss_output: dict, p) -> float:
+    """Compute the model gross aggregate savings rate."""
+    output = float(ss_output["Y"])
+    if np.isclose(output, 0.0):
+        raise ValueError("Cannot compute savings rate with zero output.")
+    growth = (1 + p.g_n_ss) * np.exp(p.g_y)
+    gross_saving_flow = (growth - 1.0) * float(ss_output["B"]) + (
+        p.delta * float(ss_output["K_d"])
+    )
+    return gross_saving_flow / output
+
+
 def compute_inheritance_moments_from_scf(
     scf: pd.DataFrame,
     amount_col: str,
@@ -469,6 +553,7 @@ def compute_data_moments(
     scf: pd.DataFrame | None = None,
     income_year: int | None = None,
     inheritance_moments: MomentSet | None = None,
+    savings_rate: float | None = None,
 ) -> MomentSet:
     """Compute the stacked data moment vector for the SMM objective."""
     if config is None:
@@ -496,6 +581,12 @@ def compute_data_moments(
     if config.include_income_gini:
         names.append("income_gini")
         values.append(income_gini_data_moment(income_year=income_year))
+
+    if config.include_savings_rate:
+        if savings_rate is None:
+            savings_rate = savings_rate_data_moment(config.macro_year)
+        names.append("savings_rate")
+        values.append(float(savings_rate))
 
     if config.include_wealth_distribution:
         if scf is None:
@@ -567,6 +658,10 @@ def compute_model_moments(
         names.append("income_gini")
         values.append(income_ineq.gini())
 
+    if config.include_savings_rate:
+        names.append("savings_rate")
+        values.append(model_savings_rate_moment(ss_output, p))
+
     if config.include_wealth_distribution:
         names.extend(_wealth_distribution_moment_names())
         values.extend(_model_wealth_distribution_moments(ss_output, p))
@@ -633,27 +728,45 @@ def pack_lifecycle_params(
     config: LifecycleCalibrationConfig | None = None,
     transform: bool = True,
 ) -> np.ndarray:
-    """Pack natural lifecycle parameters into an optimizer vector."""
+    """Pack natural lifecycle parameters into an optimizer vector.
+
+    chi_n (length p.S) is projected onto the B-spline basis in log space.
+    The returned vector layout is [beta_trans, chi_b_trans, gamma] where
+    gamma holds the chi_n spline coefficients (unconstrained when transform
+    is True, since the log-space spline already enforces positivity via exp).
+    """
     if config is None:
         config = LifecycleCalibrationConfig()
     config.validate(p)
     beta_annual = _as_vector(beta_annual)
     chi_b = _as_vector(chi_b)
     chi_n = _as_vector(chi_n)
-    est_idx = _age_indices(config.estimated_chi_n_ages, p)
-    chi_n_est = chi_n[est_idx]
-    params = np.concatenate([beta_annual, chi_b, chi_n_est])
+
+    starting_age = int(getattr(p, "starting_age", 20))
+    all_ages = np.arange(starting_age, starting_age + p.S)
+    B, _ = _build_chi_n_spline_basis(
+        all_ages, config.chi_n_n_spline_knots, config.chi_n_spline_degree
+    )
+
     if not transform:
-        return params
+        # Project chi_n directly (no log); coefficients are in natural space.
+        gamma, _, _, _ = np.linalg.lstsq(B, chi_n, rcond=None)
+        return np.concatenate([beta_annual, chi_b, gamma])
+
     if np.any((beta_annual <= 0) | (beta_annual >= 1)):
         raise ValueError(
             "beta_annual values must be strictly between 0 and 1."
         )
-    if np.any(params[beta_annual.size :] <= 0):
-        raise ValueError("chi_b and chi_n values must be positive.")
+    if np.any(chi_b <= 0):
+        raise ValueError("chi_b values must be positive.")
+    if np.any(chi_n <= 0):
+        raise ValueError("chi_n values must be positive.")
+
     beta_trans = np.log(beta_annual / (1 - beta_annual))
-    chi_trans = np.log(params[beta_annual.size :])
-    return np.concatenate([beta_trans, chi_trans])
+    chi_b_trans = np.log(chi_b)
+    # Fit spline to log(chi_n) over all model ages; gamma is unconstrained.
+    gamma, _, _, _ = np.linalg.lstsq(B, np.log(chi_n), rcond=None)
+    return np.concatenate([beta_trans, chi_b_trans, gamma])
 
 
 def unpack_lifecycle_params(
@@ -663,39 +776,48 @@ def unpack_lifecycle_params(
     base_chi_n: np.ndarray | None = None,
     transform: bool = True,
 ) -> dict[str, np.ndarray]:
-    """Unpack an optimizer vector into natural lifecycle parameters."""
+    """Unpack an optimizer vector into natural lifecycle parameters.
+
+    The chi_n block of theta holds B-spline coefficients (gamma).  When
+    transform=True the spline operates in log space and chi_n = exp(B @ gamma).
+    The base_chi_n argument is accepted for backward compatibility but is no
+    longer used; the spline covers all model ages directly.
+    """
     if config is None:
         config = LifecycleCalibrationConfig()
     config.validate(p)
-    if base_chi_n is None:
-        base_chi_n = _ss_chi_n(p)
 
     theta = _as_vector(theta)
     n_beta = p.J
     n_chi_b = p.J
-    n_chi_n = config.estimated_chi_n_ages.size
-    expected = n_beta + n_chi_b + n_chi_n
+    n_gamma = config.chi_n_n_spline_knots
+    expected = n_beta + n_chi_b + n_gamma
     if theta.size != expected:
         raise ValueError(f"Expected {expected} parameters, got {theta.size}.")
 
     beta_raw = theta[:n_beta]
     chi_b_raw = theta[n_beta : n_beta + n_chi_b]
-    chi_n_raw = theta[n_beta + n_chi_b :]
+    gamma = theta[n_beta + n_chi_b :]
+
+    starting_age = int(getattr(p, "starting_age", 20))
+    all_ages = np.arange(starting_age, starting_age + p.S)
+    B, _ = _build_chi_n_spline_basis(
+        all_ages, config.chi_n_n_spline_knots, config.chi_n_spline_degree
+    )
+
     if transform:
         beta_annual = 1 / (1 + np.exp(-beta_raw))
         chi_b = np.exp(chi_b_raw)
-        chi_n_est = np.exp(chi_n_raw)
+        chi_n = np.exp(B @ gamma)
     else:
         beta_annual = beta_raw
         chi_b = chi_b_raw
-        chi_n_est = chi_n_raw
+        chi_n = B @ gamma
 
-    chi_n = build_chi_n_profile(chi_n_est, base_chi_n, p, config)
     return {
         "beta_annual": beta_annual,
         "chi_b": chi_b,
         "chi_n": chi_n,
-        "chi_n_estimated": chi_n_est,
     }
 
 
@@ -823,6 +945,7 @@ def bootstrap_data_moments(
     cps: pd.DataFrame | None = None,
     scf: pd.DataFrame | None = None,
     seed: int | None = None,
+    savings_rate: float | None = None,
 ) -> np.ndarray:
     """Bootstrap the data moments available from CPS and SCF microdata."""
     if config is None:
@@ -834,10 +957,17 @@ def bootstrap_data_moments(
     ):
         scf = load_scf_wealth_data(config)
 
-    point_moments = compute_data_moments(p, config, cps=cps, scf=scf)
+    point_moments = compute_data_moments(
+        p,
+        config,
+        cps=cps,
+        scf=scf,
+        savings_rate=savings_rate,
+    )
     resampled_config = replace(
         config,
         include_income_gini=False,
+        include_savings_rate=False,
         include_inheritance_moments=False,
     )
     rng = np.random.default_rng(seed)
@@ -873,11 +1003,31 @@ def smm_distance(
     model_moments: MomentSet,
     data_moments: MomentSet,
     W: np.ndarray,
+    method: MomentDistanceMethod = "relative",
+    floor: float = 1e-8,
 ) -> float:
-    """Compute the quadratic SMM distance."""
+    """Compute the quadratic SMM distance.
+
+    Args:
+        model_moments: Simulated model moments.
+        data_moments: Empirical data moments.
+        W: Positive semi-definite weighting matrix.
+        method: ``"relative"`` divides each residual by ``|data_moment|``
+            (floored at ``floor``) so all moments are on a comparable
+            percentage-deviation scale.  ``"absolute"`` uses raw levels.
+        floor: Minimum absolute value used as the denominator when
+            method="relative", preventing division by zero for near-zero
+            moments such as bottom wealth shares.
+    """
     if model_moments.names != data_moments.names:
         raise ValueError("Model and data moments are not aligned.")
-    diff = model_moments.values - data_moments.values
+    m = model_moments.values
+    d = data_moments.values
+    if method == "relative":
+        safe_denom = np.where(np.abs(d) > floor, np.abs(d), floor)
+        diff = (m - d) / safe_denom
+    else:
+        diff = m - d
     if not np.all(np.isfinite(diff)):
         return np.inf
     return float(diff.T @ W @ diff)
@@ -915,7 +1065,13 @@ def smm_objective(
         )
         ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
         model_moments = compute_model_moments(ss_output, p, config)
-        distance = smm_distance(model_moments, data_moments, W)
+        distance = smm_distance(
+            model_moments,
+            data_moments,
+            W,
+            method=config.moment_distance_method,
+            floor=config.moment_distance_floor,
+        )
     except (
         AssertionError,
         FloatingPointError,
@@ -938,6 +1094,7 @@ def estimate_lifecycle_params(
     bootstrap_moments: np.ndarray | None = None,
     client=None,
     transform: bool = True,
+    savings_rate: float | None = None,
 ) -> LifecycleCalibrationResult:
     """Estimate beta_annual, chi_b, and chi_n jointly by SMM."""
     if config is None:
@@ -947,7 +1104,11 @@ def estimate_lifecycle_params(
     if theta0 is None:
         theta0 = initial_lifecycle_theta(p, config, transform=transform)
     if data_moments is None:
-        data_moments = compute_data_moments(p, config)
+        data_moments = compute_data_moments(
+            p,
+            config,
+            savings_rate=savings_rate,
+        )
     if W is None:
         W = weighting_matrix(
             data_moments.values.size,
@@ -956,23 +1117,51 @@ def estimate_lifecycle_params(
             ridge=config.weighting_ridge,
         )
     ss_cache = SSSolutionCache(use_ss_solver=config.use_ss_solver_restart)
+    objective_args = (
+        data_moments,
+        W,
+        p,
+        config,
+        base_chi_n,
+        client,
+        transform,
+        ss_cache,
+    )
+    optimizer_state = {
+        "function_evals": 0,
+        "iteration": 0,
+        "last_objective": None,
+    }
+
+    def tracked_objective(theta):
+        value = smm_objective(theta, *objective_args)
+        optimizer_state["function_evals"] += 1
+        optimizer_state["last_objective"] = value
+        return value
+
+    def optimizer_callback(_theta):
+        optimizer_state["iteration"] += 1
+        max_iterations = config.optimizer_options.get("maxiter", "?")
+        objective = optimizer_state["last_objective"]
+        if objective is None:
+            objective_text = "unavailable"
+        else:
+            objective_text = f"{objective:.6e}"
+        logger.info(
+            "Lifecycle SMM iteration %s/%s: objective=%s, function_evals=%s",
+            optimizer_state["iteration"],
+            max_iterations,
+            objective_text,
+            optimizer_state["function_evals"],
+        )
 
     est_output = opt.minimize(
-        smm_objective,
+        tracked_objective,
         theta0,
-        args=(
-            data_moments,
-            W,
-            p,
-            config,
-            base_chi_n,
-            client,
-            transform,
-            ss_cache,
-        ),
         method=config.optimizer_method,
         tol=config.optimizer_tol,
         options=config.optimizer_options,
+        callback=optimizer_callback if config.log_optimizer_progress else None,
     )
     params = unpack_lifecycle_params(
         est_output.x,
