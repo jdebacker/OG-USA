@@ -15,7 +15,6 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
-import scipy.optimize as opt
 import ogcore
 from ogcore import SS
 from ogcore.utils import Inequality
@@ -73,11 +72,11 @@ class LifecycleCalibrationConfig:
     bootstrap_iterations: int = 1000
     weighting_method: WeightingMethod = "identity"
     weighting_ridge: float = 1e-8
-    optimizer_method: str = "L-BFGS-B"
-    optimizer_tol: float = 1e-10
-    optimizer_options: dict = field(
-        default_factory=lambda: {"maxiter": 100, "maxfun": 500}
-    )
+    n_starts: int = 3
+    start_radius: float = 0.2
+    dfols_rhoend: float = 1e-6
+    dfols_maxfun: int | None = None
+    bound_epsilon: float = 1e-4
     chi_n_n_spline_knots: int = 10
     chi_n_spline_degree: int = 3
     moment_distance_method: MomentDistanceMethod = "relative"
@@ -168,10 +167,12 @@ class LifecycleCalibrationResult:
     chi_b: np.ndarray
     chi_n: np.ndarray
     objective_value: float
-    optimizer_result: opt.OptimizeResult
+    optimizer_result: object
     data_moments: MomentSet
     model_moments: MomentSet
     weighting_matrix: np.ndarray
+    best_start_index: int = 0
+    all_start_results: list = field(default_factory=list)
 
     @property
     def parameter_dict(self) -> dict[str, list[float]]:
@@ -1085,6 +1086,165 @@ def smm_objective(
     return distance
 
 
+def _apply_weight_sqrt(residuals: np.ndarray, W: np.ndarray) -> np.ndarray:
+    """Return L.T @ residuals where W = L @ L.T, so ||result||^2 = r^T W r.
+
+    For identity W this is a no-op.  For diagonal W it multiplies element-wise
+    by sqrt of the diagonal.  For a full positive definite W it uses the
+    Cholesky factor, falling back to the diagonal if W is not PD.
+    """
+    if np.allclose(W, np.eye(len(W))):
+        return residuals
+    try:
+        L = np.linalg.cholesky(W)
+        return L.T @ residuals
+    except np.linalg.LinAlgError:
+        return np.sqrt(np.maximum(np.diag(W), 0.0)) * residuals
+
+
+def smm_residual(
+    theta: np.ndarray,
+    data_moments: MomentSet,
+    W: np.ndarray,
+    p,
+    config: LifecycleCalibrationConfig,
+    base_chi_n: np.ndarray | None = None,
+    client=None,
+    transform: bool = True,
+    ss_cache: SSSolutionCache | None = None,
+) -> np.ndarray:
+    """Return the weighted moment residual vector for DFO-LS.
+
+    DFO-LS minimises ``||f(x)||^2``.  Pre-multiplying by ``W^{1/2}`` ensures
+    that ``||result||^2 == r^T W r``, matching the SMM objective.  On solver
+    failure returns a large constant vector so DFO-LS avoids that region.
+    """
+    n_moments = data_moments.values.size
+    try:
+        params = unpack_lifecycle_params(
+            theta, p, config, base_chi_n=base_chi_n, transform=transform
+        )
+        apply_lifecycle_params(
+            p, params["beta_annual"], params["chi_b"], params["chi_n"]
+        )
+        ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
+        model_moments = compute_model_moments(ss_output, p, config)
+        m = model_moments.values
+        d = data_moments.values
+        if config.moment_distance_method == "relative":
+            safe_denom = np.where(
+                np.abs(d) > config.moment_distance_floor,
+                np.abs(d),
+                config.moment_distance_floor,
+            )
+            residuals = (m - d) / safe_denom
+        else:
+            residuals = m - d
+        weighted = _apply_weight_sqrt(residuals, W)
+        if not np.all(np.isfinite(weighted)):
+            return np.full(n_moments, 1e15)
+        return weighted
+    except (
+        AssertionError,
+        FloatingPointError,
+        KeyError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return np.full(n_moments, 1e15)
+
+
+def _extract_dfols_bounds(
+    p,
+    config: LifecycleCalibrationConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build DFO-LS bound arrays from the ParamTools validators in p.
+
+    Bounds are read from ``p._data[param]['validators']['range']`` and then
+    mapped into the same transformed space used by the optimizer:
+
+    * ``beta_annual`` — logit transform; validator min/max become the
+      logit of the natural bounds (with ``bound_epsilon`` as a floor so
+      log(0) is avoided).
+    * ``chi_b`` — log transform; same epsilon floor on the natural minimum.
+    * ``chi_n`` spline ``gamma`` — the B-spline has the convex-hull
+      property: if every coefficient satisfies
+      ``log(chi_n_min) ≤ γᵢ ≤ log(chi_n_max)`` then the evaluated
+      ``chi_n = exp(B @ gamma)`` is guaranteed to stay within
+      ``[chi_n_min, chi_n_max]`` at every model age.
+
+    Returns:
+        lower: 1-D array of length n_beta + n_chi_b + n_gamma.
+        upper: 1-D array of the same length.
+    """
+    eps = config.bound_epsilon
+
+    def _range(param_name):
+        validators = p._data.get(param_name, {}).get("validators", {})
+        r = validators.get("range", {})
+        lo = float(r.get("min", -np.inf))
+        hi = float(r.get("max", np.inf))
+        return lo, hi
+
+    # --- beta_annual (logit space) ---
+    b_lo_nat, b_hi_nat = _range("beta_annual")
+    b_lo_nat = max(b_lo_nat, eps)
+    b_hi_nat = min(b_hi_nat, 1.0 - eps)
+    beta_lo = np.full(p.J, np.log(b_lo_nat / (1.0 - b_lo_nat)))
+    beta_hi = np.full(p.J, np.log(b_hi_nat / (1.0 - b_hi_nat)))
+
+    # --- chi_b (log space) ---
+    cb_lo_nat, cb_hi_nat = _range("chi_b")
+    cb_lo_nat = max(cb_lo_nat, eps)
+    chi_b_lo = np.full(p.J, np.log(cb_lo_nat))
+    chi_b_hi = np.full(p.J, np.log(cb_hi_nat))
+
+    # --- chi_n spline coefficients (log space, convex-hull argument) ---
+    cn_lo_nat, cn_hi_nat = _range("chi_n")
+    cn_lo_nat = max(cn_lo_nat, eps)
+    gamma_lo = np.full(config.chi_n_n_spline_knots, np.log(cn_lo_nat))
+    gamma_hi = np.full(config.chi_n_n_spline_knots, np.log(cn_hi_nat))
+
+    lower = np.concatenate([beta_lo, chi_b_lo, gamma_lo])
+    upper = np.concatenate([beta_hi, chi_b_hi, gamma_hi])
+    return lower, upper
+
+
+def _generate_starts(
+    theta0: np.ndarray,
+    n_starts: int,
+    radius: float,
+    lower: np.ndarray | None = None,
+    upper: np.ndarray | None = None,
+    seed: int | None = None,
+) -> list[np.ndarray]:
+    """Return n_starts starting vectors centred on theta0.
+
+    The first element is always theta0 itself (the warm start from prior
+    calibration values).  Additional points are drawn by adding additive
+    noise scaled by ``radius * max(|theta0_i|, 1.0)`` in each dimension,
+    so near-zero transformed parameters still receive meaningful perturbations.
+    All generated points are clipped to ``[lower, upper]`` when provided.
+    """
+    def _clip(x):
+        if lower is not None:
+            x = np.maximum(x, lower)
+        if upper is not None:
+            x = np.minimum(x, upper)
+        return x
+
+    starts = [_clip(theta0.copy())]
+    if n_starts <= 1:
+        return starts
+    rng = np.random.default_rng(seed)
+    scale = np.maximum(np.abs(theta0), 1.0)
+    for _ in range(n_starts - 1):
+        noise = rng.uniform(-radius, radius, size=theta0.shape) * scale
+        starts.append(_clip(theta0 + noise))
+    return starts
+
+
 def estimate_lifecycle_params(
     p,
     config: LifecycleCalibrationConfig | None = None,
@@ -1096,7 +1256,9 @@ def estimate_lifecycle_params(
     transform: bool = True,
     savings_rate: float | None = None,
 ) -> LifecycleCalibrationResult:
-    """Estimate beta_annual, chi_b, and chi_n jointly by SMM."""
+    """Estimate beta_annual, chi_b, and chi_n jointly by SMM using DFO-LS."""
+    import dfols
+
     if config is None:
         config = LifecycleCalibrationConfig()
     config.validate(p)
@@ -1116,55 +1278,67 @@ def estimate_lifecycle_params(
             bootstrap_moments=bootstrap_moments,
             ridge=config.weighting_ridge,
         )
-    ss_cache = SSSolutionCache(use_ss_solver=config.use_ss_solver_restart)
-    objective_args = (
-        data_moments,
-        W,
-        p,
-        config,
-        base_chi_n,
-        client,
-        transform,
-        ss_cache,
-    )
-    optimizer_state = {
-        "function_evals": 0,
-        "iteration": 0,
-        "last_objective": None,
-    }
 
-    def tracked_objective(theta):
-        value = smm_objective(theta, *objective_args)
-        optimizer_state["function_evals"] += 1
-        optimizer_state["last_objective"] = value
-        return value
-
-    def optimizer_callback(_theta):
-        optimizer_state["iteration"] += 1
-        max_iterations = config.optimizer_options.get("maxiter", "?")
-        objective = optimizer_state["last_objective"]
-        if objective is None:
-            objective_text = "unavailable"
-        else:
-            objective_text = f"{objective:.6e}"
-        logger.info(
-            "Lifecycle SMM iteration %s/%s: objective=%s, function_evals=%s",
-            optimizer_state["iteration"],
-            max_iterations,
-            objective_text,
-            optimizer_state["function_evals"],
-        )
-
-    est_output = opt.minimize(
-        tracked_objective,
+    lower, upper = _extract_dfols_bounds(p, config)
+    starts = _generate_starts(
         theta0,
-        method=config.optimizer_method,
-        tol=config.optimizer_tol,
-        options=config.optimizer_options,
-        callback=optimizer_callback if config.log_optimizer_progress else None,
+        config.n_starts,
+        config.start_radius,
+        lower=lower,
+        upper=upper,
     )
+    best_result = None
+    best_obj = np.inf
+    best_start_index = 0
+    all_start_results = []
+
+    for i, theta_start in enumerate(starts):
+        logger.info(
+            "Lifecycle SMM: DFO-LS start %d/%d", i + 1, config.n_starts
+        )
+        ss_cache = SSSolutionCache(use_ss_solver=config.use_ss_solver_restart)
+
+        def residual_fn(theta, _cache=ss_cache):
+            return smm_residual(
+                theta,
+                data_moments,
+                W,
+                p,
+                config,
+                base_chi_n=base_chi_n,
+                client=client,
+                transform=transform,
+                ss_cache=_cache,
+            )
+
+        maxfun = config.dfols_maxfun
+        dfols_result = dfols.solve(
+            residual_fn,
+            theta_start,
+            bounds=(lower, upper),
+            rhoend=config.dfols_rhoend,
+            maxfun=maxfun,
+            do_logging=config.log_optimizer_progress,
+            print_progress=False,
+        )
+        all_start_results.append(dfols_result)
+        obj = float(dfols_result.cost)
+        logger.info(
+            "Lifecycle SMM: start %d/%d finished — objective=%.6e, "
+            "evals=%d, msg=%s",
+            i + 1,
+            config.n_starts,
+            obj,
+            dfols_result.nf,
+            dfols_result.msg,
+        )
+        if obj < best_obj:
+            best_obj = obj
+            best_result = dfols_result
+            best_start_index = i
+
     params = unpack_lifecycle_params(
-        est_output.x,
+        best_result.x,
         p,
         config,
         base_chi_n=base_chi_n,
@@ -1176,6 +1350,7 @@ def estimate_lifecycle_params(
         params["chi_b"],
         params["chi_n"],
     )
+    ss_cache = SSSolutionCache(use_ss_solver=config.use_ss_solver_restart)
     ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
     model_moments = compute_model_moments(ss_output, p, config)
 
@@ -1183,11 +1358,13 @@ def estimate_lifecycle_params(
         beta_annual=params["beta_annual"],
         chi_b=params["chi_b"],
         chi_n=params["chi_n"],
-        objective_value=float(est_output.fun),
-        optimizer_result=est_output,
+        objective_value=best_obj,
+        optimizer_result=best_result,
         data_moments=data_moments,
         model_moments=model_moments,
         weighting_matrix=W,
+        best_start_index=best_start_index,
+        all_start_results=all_start_results,
     )
 
 
