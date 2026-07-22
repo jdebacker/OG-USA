@@ -1206,8 +1206,8 @@ def _extract_dfols_bounds(
     gamma_lo = np.full(config.chi_n_n_spline_knots, np.log(cn_lo_nat))
     gamma_hi = np.full(config.chi_n_n_spline_knots, np.log(cn_hi_nat))
 
-    lower = np.concatenate([beta_lo, chi_b_lo, gamma_lo])
-    upper = np.concatenate([beta_hi - 0.00015, chi_b_hi / 2, gamma_hi / 2])  # TODO: check if want to divide in half, but want to keep away from parameter range extremes as it keeps hitting in the optimization routine even with these bounds
+    lower = np.concatenate([0.8, 0.1, gamma_lo])
+    upper = np.concatenate([0.999, 200, gamma_hi])  # TODO: check if want to divide in half, but want to keep away from parameter range extremes as it keeps hitting in the optimization routine even with these bounds
     return lower, upper
 
 
