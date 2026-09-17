@@ -128,6 +128,18 @@ with the existing Dask pattern, with a serial fallback.
 
 ### Phase 3. Concentrate out chi_n
 
+Status: done 2026-09-16 (`invert_chi_n`, `chi_n_update`,
+`aggregate_labor_by_age` in `ogusa/calibrate_lifecycle.py`). At the
+default-parameter equilibrium prices the inversion converges in 7 passes
+and about 4 seconds to a maximum absolute log gap of 6e-4 between model and
+CPS hours at every age 20 to 79. The resulting `chi_n` is about 254 at age
+20, 42 to 58 over ages 30 to 50, 110 at 60, 267 at 65, 1,047 at 70, 3,471
+at 75, and 4,542 at 79, held flat from 80 on. The 10,000 cap does not bind.
+Whether values in the thousands at old ages are acceptable, or whether the
+target at 70 plus should switch to hours conditional on working, remains
+the maintainer's call. The general-equilibrium feedback (prices moving
+after the hours change) is handled by the Phase 5 outer loop.
+
 Iterate: solve households at fixed prices, form lambda-weighted mean hours
 by age, update each age's `chi_n` by the ratio of marginal disutility at
 model hours to that at data hours, repeat. Hold `chi_n` flat in logs for

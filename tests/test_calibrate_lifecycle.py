@@ -237,3 +237,199 @@ def test_partial_equilibrium_reproduces_general_equilibrium_households():
     assert np.allclose(env_stored.bq, env_rebuilt.bq)
     assert np.allclose(env_stored.tr, env_rebuilt.tr)
     assert np.allclose(env_stored.ubi, env_rebuilt.ubi)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: chi_n inversion
+# ---------------------------------------------------------------------------
+
+
+class MockLaborParams:
+    """
+    Parameter object with the elliptical utility fields chi_n updates need.
+    """
+
+    S = 80
+    J = 2
+    starting_age = 20
+    ending_age = 100
+    ltilde = 1.0
+    b_ellipse = 0.573
+    upsilon = 2.856
+    lambdas = np.array([0.6, 0.4]).reshape(2, 1)
+    omega_SS = np.ones(80) / 80
+    FOC_root_method = "hybr"
+    _data = {"chi_n": {"validators": {"range": {"min": 0.0, "max": 1e4}}}}
+
+    def __init__(self):
+        self.chi_n = np.tile(np.linspace(20.0, 80.0, self.S), (2, 1))
+
+    def update_specifications(self, revision):
+        chi_n = np.asarray(revision["chi_n"], dtype=float)
+        if np.any(chi_n > 1e4) or np.any(chi_n < 0):
+            raise ValueError("chi_n out of range")
+        self.chi_n = np.tile(chi_n, (2, 1))
+
+
+def _hours_from_foc(chi_n, lhs, p):
+    """
+    Solve chi_n * MDU(n) = lhs for n, age by age, by bisection.
+    """
+    from ogcore import household
+
+    n = np.zeros_like(chi_n)
+    for s in range(chi_n.size):
+        lo, hi = 1e-6, p.ltilde - 1e-6
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            value = float(household.marg_ut_labor(np.array([mid]), 1.0, p))
+            if chi_n[s] * value > lhs[s]:
+                hi = mid
+            else:
+                lo = mid
+        n[s] = 0.5 * (lo + hi)
+    return n
+
+
+def test_aggregate_labor_by_age_uses_type_weights():
+    """
+    Hours are averaged over types with within-age population weights.
+    """
+    p = MockLaborParams()
+    n = np.zeros((p.S, p.J))
+    n[:, 0] = 0.2
+    n[:, 1] = 0.5
+    ages = np.array([20, 50, 79])
+    labor = cl.aggregate_labor_by_age(n, p, ages)
+    assert np.allclose(labor, 0.6 * 0.2 + 0.4 * 0.5)
+
+
+def test_chi_n_update_is_exact_with_fixed_lhs():
+    """
+    One full step hits the target when the FOC left-hand side is fixed.
+    """
+    p = MockLaborParams()
+    chi_n = np.array([20.0, 40.0, 60.0])
+    lhs = np.array([1.5, 1.5, 1.5])
+    n_model = _hours_from_foc(chi_n, lhs, p)
+    n_target = np.array([0.3, 0.2, 0.05])
+    new_chi_n = cl.chi_n_update(chi_n, n_model, n_target, p)
+    assert np.allclose(_hours_from_foc(new_chi_n, lhs, p), n_target, atol=1e-6)
+    # Higher target hours require lower chi_n and vice versa.
+    assert np.all((new_chi_n > chi_n) == (n_target < n_model))
+    # No step with zero damping.
+    assert np.allclose(
+        cl.chi_n_update(chi_n, n_model, n_target, p, 0.0), chi_n
+    )
+
+
+def test_invert_chi_n_converges_on_fixed_lhs_household_block(monkeypatch):
+    """
+    With a fixed FOC left-hand side the inversion converges in a few passes.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    p = MockLaborParams()
+    lhs = np.linspace(2.0, 1.0, p.S)  # falls with age like w*e*(1-mtr)*c^-s
+    calls = []
+
+    def fake_partial_equilibrium_ss(
+        ss_output, params, client=None, b_guess=None, n_guess=None
+    ):
+        calls.append(1)
+        chi_n = params.chi_n[-1, :]
+        n_one = _hours_from_foc(chi_n, lhs, params)
+        n = np.tile(n_one.reshape(-1, 1), (1, params.J))
+        updated = dict(ss_output)
+        updated["n"] = n
+        updated["b_sp1"] = ss_output["b_sp1"]
+        return updated, cl.HouseholdSolution(
+            b_sp1=updated["b_sp1"],
+            n=n,
+            euler_errors=np.zeros((2 * params.S, params.J)),
+            success=np.ones(params.J, dtype=bool),
+        )
+
+    monkeypatch.setattr(
+        cl, "partial_equilibrium_ss", fake_partial_equilibrium_ss
+    )
+    config = elp.LifecycleCalibrationConfig(chi_n_tail_method="flat")
+    ages = config.moment_ages
+    target = np.interp(ages, [20, 30, 60, 79], [0.18, 0.30, 0.25, 0.04])
+    ss_output = {
+        "b_sp1": np.ones((p.S, p.J)),
+        "n": np.ones((p.S, p.J)) * 0.3,
+    }
+
+    result = cl.invert_chi_n(ss_output, p, target, config=config, tol=1e-6)
+
+    assert result.converged
+    assert result.iterations <= 3
+    assert len(calls) == result.iterations
+    assert np.allclose(result.labor_model, target, rtol=1e-5)
+    assert result.chi_n.shape == (p.S,)
+    assert np.allclose(p.chi_n[-1, :], result.chi_n)
+    # Flat tail in levels beyond the last target age.
+    assert np.allclose(result.chi_n[60:], result.chi_n[59])
+    assert result.capped_ages.size == 0
+    # chi_n rises steeply where target hours are tiny.
+    assert result.chi_n[59] > 10 * result.chi_n[30]
+
+
+def test_invert_chi_n_reports_capped_ages(monkeypatch):
+    """
+    Ages whose required chi_n exceeds the bound are clipped and reported.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    p = MockLaborParams()
+    lhs = np.full(p.S, 3.0)
+
+    def fake_partial_equilibrium_ss(
+        ss_output, params, client=None, b_guess=None, n_guess=None
+    ):
+        n_one = _hours_from_foc(params.chi_n[-1, :], lhs, params)
+        n = np.tile(n_one.reshape(-1, 1), (1, params.J))
+        updated = dict(ss_output)
+        updated["n"] = n
+        return updated, cl.HouseholdSolution(
+            b_sp1=ss_output["b_sp1"],
+            n=n,
+            euler_errors=np.zeros((2 * params.S, params.J)),
+            success=np.ones(params.J, dtype=bool),
+        )
+
+    monkeypatch.setattr(
+        cl, "partial_equilibrium_ss", fake_partial_equilibrium_ss
+    )
+    config = elp.LifecycleCalibrationConfig()
+    target = np.full(config.moment_ages.size, 0.3)
+    target[-5:] = 0.001  # needs chi_n far above the cap
+    ss_output = {"b_sp1": np.ones((p.S, p.J)), "n": np.ones((p.S, p.J)) * 0.3}
+
+    result = cl.invert_chi_n(
+        ss_output, p, target, config=config, chi_n_max=500.0, max_iter=5
+    )
+
+    assert not result.converged
+    assert result.iterations == 5
+    assert np.array_equal(result.capped_ages, config.moment_ages[-5:])
+    assert np.all(result.chi_n <= 500.0)
+    assert np.allclose(result.labor_model[:-5], 0.3, rtol=1e-3)
+
+
+def test_invert_chi_n_validates_targets():
+    """
+    Targets must be one per age and strictly inside the time endowment.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    p = MockLaborParams()
+    config = elp.LifecycleCalibrationConfig()
+    ss_output = {"b_sp1": np.ones((p.S, p.J)), "n": np.ones((p.S, p.J))}
+    with pytest.raises(ValueError, match="one value per target age"):
+        cl.invert_chi_n(ss_output, p, np.ones(5) * 0.3, config=config)
+    bad = np.full(config.moment_ages.size, 0.3)
+    bad[0] = 0.0
+    with pytest.raises(ValueError, match="strictly inside"):
+        cl.invert_chi_n(ss_output, p, bad, config=config)

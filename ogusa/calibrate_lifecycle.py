@@ -286,3 +286,194 @@ def partial_equilibrium_ss(
     updated["b_s"] = np.vstack([np.zeros((1, p.J)), solution.b_sp1[:-1, :]])
     updated["n"] = solution.n
     return updated, solution
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: concentrate out chi_n by inverting the labor first-order condition
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ChiNInversionResult:
+    """Outcome of the chi_n inversion at fixed prices."""
+
+    chi_n: np.ndarray
+    ages: np.ndarray
+    labor_model: np.ndarray
+    labor_target: np.ndarray
+    iterations: int
+    converged: bool
+    max_abs_log_gap: float
+    history: list
+    capped_ages: np.ndarray
+    ss_output: dict
+    solution: HouseholdSolution
+
+
+def aggregate_labor_by_age(n: np.ndarray, p, ages: np.ndarray) -> np.ndarray:
+    """Population-weighted mean labor supply at each requested age."""
+    from ogusa import estimate_lifecycle_params as elp
+
+    n = np.asarray(n, dtype=float)
+    weights = elp._type_weights_by_age(p)
+    idx = elp._age_indices(np.asarray(ages), p)
+    return (n[idx, :] * weights[idx, :]).sum(axis=1)
+
+
+def chi_n_update(
+    chi_n_values: np.ndarray,
+    labor_model: np.ndarray,
+    labor_target: np.ndarray,
+    p,
+    damping: float = 1.0,
+) -> np.ndarray:
+    """One inversion step of the labor first-order condition.
+
+    The steady-state labor FOC is ``chi_n[s] * MDU(n) = LHS[s]`` where the
+    right-hand side depends on wages, taxes, and consumption.  Holding that
+    side fixed, the ``chi_n`` that delivers the target hours is
+    ``chi_n * MDU(n_model) / MDU(n_target)``.  ``damping`` raises the ratio
+    to a power: 1 is the full step, below 1 damps, above 1 over-relaxes to
+    offset the consumption response that makes hours move less than the
+    fixed-LHS step predicts.
+    """
+    chi_n_values = np.asarray(chi_n_values, dtype=float)
+    ratio = household.marg_ut_labor(
+        np.asarray(labor_model, dtype=float), 1.0, p
+    ) / household.marg_ut_labor(np.asarray(labor_target, dtype=float), 1.0, p)
+    return chi_n_values * np.asarray(ratio, dtype=float) ** damping
+
+
+def apply_chi_n(p, chi_n: np.ndarray) -> None:
+    """Set the steady-state chi_n age profile on the spec (validated)."""
+    p.update_specifications(
+        {"chi_n": np.asarray(chi_n, dtype=float).reshape(-1).tolist()}
+    )
+
+
+def _chi_n_bounds(p, chi_n_min: float | None, chi_n_max: float | None):
+    """Natural bounds for chi_n from the validators unless overridden."""
+    from ogusa import estimate_lifecycle_params as elp
+
+    lo, hi = elp._validator_range(p, "chi_n")
+    lo = max(lo, 1e-8) if chi_n_min is None else float(chi_n_min)
+    hi = hi if chi_n_max is None else float(chi_n_max)
+    return lo, hi
+
+
+def invert_chi_n(
+    ss_output: dict,
+    p,
+    labor_target: np.ndarray,
+    config=None,
+    max_iter: int = 30,
+    tol: float = 1e-3,
+    damping: float = 1.0,
+    chi_n_min: float | None = None,
+    chi_n_max: float | None = None,
+    client=None,
+) -> ChiNInversionResult:
+    """Choose chi_n by age so model hours match ``labor_target`` at fixed prices.
+
+    Iterates: solve the household block at the prices in ``ss_output``,
+    form population-weighted hours at each target age, update ``chi_n`` at
+    those ages with :func:`chi_n_update`, and repeat until the largest
+    absolute log gap between model and target hours is below ``tol``.
+    Ages above the last target age are filled with
+    :func:`ogusa.estimate_lifecycle_params.build_chi_n_profile` using
+    ``config.chi_n_tail_method`` (default: the initial profile's tail
+    rescaled to join the last estimated value).  Values are clipped to the
+    ParamTools range for ``chi_n`` unless narrower bounds are given, and the
+    ages where the cap binds are reported.
+
+    On return ``p`` carries the final ``chi_n`` and ``result.ss_output`` is
+    the household solution at that profile, ready for
+    :func:`ogusa.estimate_lifecycle_params.compute_model_moments`.
+    """
+    from dataclasses import replace
+
+    from ogusa import estimate_lifecycle_params as elp
+
+    if config is None:
+        config = elp.LifecycleCalibrationConfig()
+    config = replace(
+        config,
+        estimate_chi_n_min_age=config.min_age,
+        estimate_chi_n_max_age=config.max_age,
+    )
+    config.validate(p)
+    ages = config.moment_ages
+    labor_target = np.asarray(labor_target, dtype=float).reshape(-1)
+    if labor_target.size != ages.size:
+        raise ValueError("labor_target must have one value per target age.")
+    if np.any(labor_target <= 0) or np.any(labor_target >= p.ltilde):
+        raise ValueError("labor_target must lie strictly inside (0, ltilde).")
+    lo, hi = _chi_n_bounds(p, chi_n_min, chi_n_max)
+
+    base_chi_n = elp._ss_chi_n(p)
+    est_idx = elp._age_indices(ages, p)
+    chi_n = base_chi_n.copy()
+    b_guess = np.asarray(ss_output["b_sp1"], dtype=float)
+    n_guess = np.asarray(ss_output["n"], dtype=float)
+    history: list[float] = []
+    converged = False
+    capped = np.zeros(ages.size, dtype=bool)
+    updated = ss_output
+    solution = None
+    labor_model = np.full(ages.size, np.nan)
+    iterations = 0
+
+    for iterations in range(1, max_iter + 1):
+        apply_chi_n(p, chi_n)
+        updated, solution = partial_equilibrium_ss(
+            ss_output, p, client=client, b_guess=b_guess, n_guess=n_guess
+        )
+        labor_model = aggregate_labor_by_age(updated["n"], p, ages)
+        gap = np.log(labor_model / labor_target)
+        max_gap = float(np.max(np.abs(gap)))
+        history.append(max_gap)
+        logger.info(
+            "chi_n inversion iteration %d: max |log(n_model/n_target)| = %.3e",
+            iterations,
+            max_gap,
+        )
+        if max_gap < tol:
+            converged = True
+            break
+        if iterations == max_iter:
+            break
+        new_values = chi_n_update(
+            chi_n[est_idx], labor_model, labor_target, p, damping=damping
+        )
+        capped = new_values >= hi
+        new_values = np.clip(new_values, lo, hi)
+        chi_n = elp.build_chi_n_profile(new_values, base_chi_n, p, config)
+        chi_n = np.clip(chi_n, lo, hi)
+        b_guess, n_guess = solution.b_sp1, solution.n
+
+    if not converged:
+        logger.warning(
+            "chi_n inversion did not converge in %d iterations "
+            "(max |log gap| = %.3e).",
+            iterations,
+            history[-1],
+        )
+    if np.any(capped):
+        logger.warning(
+            "chi_n hit its upper bound %.0f at ages %s.",
+            hi,
+            ages[capped].tolist(),
+        )
+    return ChiNInversionResult(
+        chi_n=chi_n,
+        ages=ages,
+        labor_model=labor_model,
+        labor_target=labor_target,
+        iterations=iterations,
+        converged=converged,
+        max_abs_log_gap=history[-1],
+        history=history,
+        capped_ages=ages[capped],
+        ss_output=updated,
+        solution=solution,
+    )
