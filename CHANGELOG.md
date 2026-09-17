@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ogusa/calibrate_lifecycle.py`: household-only steady-state solve (`HouseholdEnvironment`, `solve_households`, `partial_equilibrium_ss`) that re-solves every lifetime-income type's Euler equations at fixed prices, transfers, bequests, and scaling factor from an OG-Core steady-state output. It reproduces the general-equilibrium household solution at equilibrium prices in well under a second serially and is the inner loop for the preference-parameter calibration.
+
 ### Changed
 
 - `ogusa/estimate_lifecycle_params.py` now builds the default preference-calibration moment set as hours by single year of age (CPS, lightly smoothed), one SCF wealth share per lifetime-income type with percentile bins taken from `p.lambdas`, and the ratio of mean SCF net worth at ages 75-79 to ages 60-64. The normalized wealth-by-age profile, income Gini, gross saving rate, wealth Gini, variance of log wealth, and aggregate bequests over GDP are optional or diagnostic moments. See `LIFECYCLE_CALIBRATION_PLAN.md`.

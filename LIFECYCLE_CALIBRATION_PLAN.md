@@ -101,11 +101,30 @@ found to drop the wealthiest observation from the top bin; fixed.
 
 ### Phase 2. Household-only solver wrapper
 
+Status: done 2026-09-16 in `ogusa/calibrate_lifecycle.py`
+(`HouseholdEnvironment`, `solve_households`, `partial_equilibrium_ss`).
+Validated against a cold general-equilibrium solve with the default
+parameters: the household-only re-solve reproduces `b_sp1` and `n` to
+about 1e-12 relative error. Timings on the development machine:
+
+| Solve | Time |
+|---|---|
+| General-equilibrium steady state, cold, 5 Dask workers | 1028 s |
+| Household-only re-solve, serial | 0.5 s |
+| Household-only re-solve, 5 Dask workers | 14 s |
+
+The household block itself is cheap; the Dask path is dominated by
+scattering the parameters object. Use `client=None` for the inner loops in
+Phases 3 and 4. The general-equilibrium solve's cost is therefore mostly
+outer-loop iterations and per-iteration Dask overhead, which is worth
+revisiting in Phase 5 (a serial general-equilibrium solve may be faster).
+
 A function that takes a steady-state output dictionary and solves only the
 household block at fixed prices, taxes, bequests, transfers, and scaling
-factor, using `SS.solve_for_j`, `aggregates.get_io_prices`,
-`aggregates.get_ptilde`, and the `household.get_bq` / `get_tr` / `get_rm`
-helpers. Parallelize across types with the existing Dask pattern.
+factor, using `SS.solve_for_j`, `aggregates.get_io_prices` (or
+`io_matrix @ p_m` on older OG-Core), `aggregates.get_ptilde`, and the
+`household.get_bq` / `get_tr` / `get_rm` helpers. Parallelize across types
+with the existing Dask pattern, with a serial fallback.
 
 ### Phase 3. Concentrate out chi_n
 
