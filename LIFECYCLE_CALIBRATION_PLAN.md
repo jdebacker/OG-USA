@@ -137,8 +137,18 @@ CPS hours at every age 20 to 79. The resulting `chi_n` is about 254 at age
 at 75, and 4,542 at 79, held flat from 80 on. The 10,000 cap does not bind.
 Whether values in the thousands at old ages are acceptable, or whether the
 target at 70 plus should switch to hours conditional on working, remains
-the maintainer's call. The general-equilibrium feedback (prices moving
-after the hours change) is handled by the Phase 5 outer loop.
+the maintainer's call.
+
+The general-equilibrium feedback is large and must be handled by the
+Phase 5 outer loop: re-solving the steady state with the inverted `chi_n`
+lowers aggregate labor and output by about 36 percent, raises the income
+scaling factor by 57 percent, and pushes hours back above target by 8 to
+20 percent (log gap) because lower consumption raises the marginal utility
+of consumption. That same re-solve, run serially from cold guesses, took
+20 seconds, against 1,028 seconds for the Phase 2 solve with five Dask
+workers. Dask overhead dominates the steady-state solve on this machine;
+Phase 5 should run the general-equilibrium solve serially, which makes
+even a dozen outer iterations cheap.
 
 Iterate: solve households at fixed prices, form lambda-weighted mean hours
 by age, update each age's `chi_n` by the ratio of marginal disutility at
