@@ -570,7 +570,49 @@ def _living_wealth_distribution(ss_output: dict, p):
     """
     b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
     joint = _joint_pop_weights(p)
-    return b_sp1[:-1, :], joint[1:, :]
+    weights = joint[1:, :]
+    # Renormalize so cumulative weights reach one; otherwise percentile
+    # targets above the retained population share all map to the top cell.
+    return b_sp1[:-1, :], weights / weights.sum()
+
+
+def percentile_bin_shares(
+    dist: np.ndarray,
+    weights: np.ndarray,
+    bin_weights: np.ndarray,
+) -> np.ndarray:
+    """Share of a distribution held by consecutive population bins.
+
+    Cells are sorted by ``dist``; the cumulative population weight is
+    compared with the cumulative ``bin_weights``.  A cell that straddles a
+    cutoff is split in proportion, so the result does not depend on how
+    coarse the cells are.  ``weights`` are normalized to sum to one.
+
+    Args:
+        dist: values (any shape), e.g. wealth by age and type.
+        weights: population weights with the same shape as ``dist``.
+        bin_weights: population shares of the bins, summing to one.
+
+    Returns:
+        Array with one share per bin, summing to one.
+    """
+    values = np.asarray(dist, dtype=float).ravel()
+    w = np.asarray(weights, dtype=float).ravel()
+    w = w / w.sum()
+    order = np.argsort(values, kind="stable")
+    values = values[order]
+    w = w[order]
+    cum_w = np.concatenate([[0.0], np.cumsum(w)])
+    cum_wealth = np.concatenate([[0.0], np.cumsum(values * w)])
+    total_wealth = cum_wealth[-1]
+    cutoffs = np.concatenate([[0.0], np.cumsum(_as_vector(bin_weights))])
+    cutoffs[-1] = 1.0
+    # Wealth held below each cutoff, interpolating within the straddling
+    # cell (constant value within a cell, so linear in population weight).
+    below = np.interp(cutoffs, cum_w, cum_wealth)
+    if np.isclose(total_wealth, 0.0):
+        raise ValueError("Total wealth is zero; shares are undefined.")
+    return np.diff(below) / total_wealth
 
 
 def model_wealth_shares(ss_output: dict, p) -> np.ndarray:
@@ -581,19 +623,8 @@ def model_wealth_shares(ss_output: dict, p) -> np.ndarray:
     ``j`` is a population percentile bin, exactly as in the SCF data moment
     from :func:`ogusa.wealth.compute_wealth_moments`.
     """
-    lambdas = _lambdas(p)
     dist, weights = _living_wealth_distribution(ss_output, p)
-    ineq = Inequality(dist, weights, lambdas, dist.shape[0], p.J)
-    cum = np.cumsum(lambdas)
-    top = np.array([ineq.top_share(1.0 - c) for c in cum[:-1]])
-    shares = np.empty(lambdas.size)
-    if lambdas.size == 1:
-        shares[0] = 1.0
-        return shares
-    shares[0] = 1.0 - top[0]
-    shares[1:-1] = top[:-1] - top[1:]
-    shares[-1] = top[-1]
-    return shares
+    return percentile_bin_shares(dist, weights, _lambdas(p))
 
 
 def _model_wealth_distribution_moments(

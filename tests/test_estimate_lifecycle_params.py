@@ -174,9 +174,28 @@ def test_model_wealth_shares_match_type_shares():
 
     assert shares.shape == (p.J,)
     assert np.isclose(shares.sum(), 1.0)
-    # Percentile cutoffs land on cell boundaries up to one age cell.
-    assert np.allclose(shares, expected, atol=0.02)
-    assert np.argmax(shares) == np.argmax(expected)
+    # With wealth constant within type, sorting by wealth sorts by type and
+    # each percentile bin is exactly one type, so shares match tightly even
+    # for the smallest top bins.
+    assert np.allclose(shares, expected, rtol=1e-8)
+    assert np.all(shares[6:] > 0)
+
+
+def test_percentile_bin_shares_split_straddling_cells():
+    """
+    A cutoff inside a cell allocates that cell's wealth proportionally.
+    """
+    dist = np.array([1.0, 2.0, 4.0])
+    weights = np.array([0.5, 0.25, 0.25])
+    shares = elp.percentile_bin_shares(dist, weights, np.array([0.6, 0.4]))
+    # Bottom 60%: all of cell 1 (0.5) plus 0.1/0.25 of cell 2 (value 2).
+    total = 1.0 * 0.5 + 2.0 * 0.25 + 4.0 * 0.25
+    bottom = (1.0 * 0.5 + 2.0 * 0.1) / total
+    assert np.allclose(shares, [bottom, 1.0 - bottom])
+    assert np.isclose(shares.sum(), 1.0)
+    # Weights need not be normalized on input.
+    scaled = elp.percentile_bin_shares(dist, weights * 7, np.array([0.6, 0.4]))
+    assert np.allclose(scaled, shares)
 
 
 def test_model_wealth_shares_use_joint_population_weights():
