@@ -150,9 +150,16 @@ def compute_wealth_moments(scf, bin_weights):
     for i in range(J):
         # Get number of individuals at top of percentile bin
         cutoff = scf.wgt.sum() * cum_weights[i]
-        wealth[i] = (
-            scf.weight_networth[cumsum < cutoff].sum()
-        ) / total_weight_wealth
+        if i == J - 1:
+            # The top bin runs to the end of the distribution.  A strict
+            # inequality would drop the wealthiest observation(s) whose
+            # cumulative weight equals the total, so shares would not sum
+            # to one.
+            wealth[i] = 1.0
+        else:
+            wealth[i] = (
+                scf.weight_networth[cumsum < cutoff].sum()
+            ) / total_weight_wealth
 
     wealth_share = np.zeros(J)
     wealth_share[0] = wealth[0]

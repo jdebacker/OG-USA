@@ -87,16 +87,6 @@ ogusa = [
     "data/SCF/*.csv",
 ]
 
-[tool.uv]
-dev-dependencies = [
-    "coverage",
-    "pytest>=6.0",
-    "pytest-cov",
-    "pytest-xdist",
-    "ruff",
-    "linecheck",
-]
-
 [tool.ruff]
 line-length = 79
 target-version = "py312"
@@ -113,7 +103,6 @@ ignore = ["E501", "F841", "W505"]
 
 [tool.ruff.lint.per-file-ignores]
 "ogusa/__init__.py" = ["F403"]
-"ogusa/calibrate_chi_n.py" = ["E402", "F401"]
 "ogusa/get_micro_data.py" = ["F401"]
 "ogusa/labor.py" = ["F401", "F821"]
 "ogusa/psid_summ_stats.py" = ["F401"]
@@ -134,5 +123,11 @@ markers = [
 
 [dependency-groups]
 dev = [
+    "coverage",
+    "pytest>=6.0",
+    "pytest-cov",
+    "pytest-xdist",
+    "ruff",
+    "linecheck",
     "ipykernel>=7.3.0",
 ]

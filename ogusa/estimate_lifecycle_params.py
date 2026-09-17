@@ -1,14 +1,32 @@
 """
-Joint SMM calibration of beta, chi_b, and chi_n parameters.
+Moments and helpers for calibrating beta, chi_b, and chi_n in OG-USA.
 
-This module estimates the preference parameters that govern savings,
-bequests, and labor supply in one steady-state SMM problem.  It is designed
-as a standalone calibration layer; callers can wire the returned parameter
-values into the standard OG-USA calibration flow after validating the fit.
+This module holds the data and model moment construction used to calibrate
+the household preference parameters that govern savings (``beta_annual``),
+bequests (``chi_b``), and labor supply (``chi_n``).  The default moment set
+is:
+
+* mean hours by single year of age from the CPS ASEC (targets for ``chi_n``),
+* wealth shares held by each lifetime-income type, with the SCF percentile
+  bins taken from ``p.lambdas`` (targets for ``beta_annual`` by type),
+* the ratio of mean net worth at ages 75-79 to ages 60-64 from the SCF
+  (target for ``chi_b``).
+
+Aggregate bequests over GDP, the income Gini, the gross saving rate, a
+normalized wealth-by-age profile, and SCF inheritance moments are available
+as optional or diagnostic moments.
+
+The module also retains a joint DFO-LS SMM driver
+(:func:`estimate_lifecycle_params`) that solves the full general-equilibrium
+steady state on every evaluation.  It is intended for inference (standard
+errors and overidentification tests) starting from an already calibrated
+point, not as the primary calibration path.  See
+``LIFECYCLE_CALIBRATION_PLAN.md`` in the repository root.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Literal
@@ -21,6 +39,11 @@ from ogcore.utils import Inequality
 
 from ogusa import compute_moments, wealth
 
+try:  # optional dependency used only by the SMM inference driver
+    import dfols
+except ImportError:  # pragma: no cover - exercised only without dfo-ls
+    dfols = None
+
 ogcore.config.VERBOSE = False
 logger = logging.getLogger(__name__)
 
@@ -28,48 +51,69 @@ WeightingMethod = Literal["identity", "diagonal", "optimal"]
 TailMethod = Literal["scaled_default", "flat"]
 WealthProfileMoment = Literal["anchor_window", "level", "mean_normalized"]
 MomentDistanceMethod = Literal["absolute", "relative"]
-WEALTH_MOMENT_BIN_WEIGHTS = np.array(
-    [0.25, 0.25, 0.20, 0.10, 0.10, 0.09, 0.01]
-)
 SAVINGS_RATE_DATA_LABEL = r"Gross savings rate $(S/Y)$"
+HOURS_IN_TIME_ENDOWMENT = (24 - 8) * 7  # weekly hours net of sleep
 
 
 @dataclass(frozen=True)
 class LifecycleCalibrationConfig:
     """
-    Configuration for the joint lifecycle preference calibration.
+    Configuration for the lifecycle preference moments and calibration.
 
-    The default labor age window is 20 through 79.  Wealth-profile moments
-    use ages 21 through 79 and are normalized by the mean wealth level from
-    ages 20 through 24.  chi_n is parameterized as a cubic B-spline in log
-    space over all model ages, with chi_n_n_spline_knots basis functions.
-    That gives 2*J + chi_n_n_spline_knots parameters and ~130 default
-    moments when J=10 and chi_n_n_spline_knots=10 (30 parameters total).
+    Default targets are mean hours by single year of age from 20 through 79,
+    one SCF wealth share per lifetime-income type (bins from ``p.lambdas``),
+    and the old-age wealth ratio (mean net worth at 75-79 over 60-64).  The
+    normalized wealth-by-age profile, income Gini, gross saving rate,
+    wealth Gini, variance of log wealth, aggregate bequests over GDP, and
+    inheritance moments are off by default and can be switched on for
+    diagnostics or robustness checks.
+
+    Wealth held at age ``a`` corresponds to model savings ``b_sp1`` chosen
+    at age ``a - 1``, so wealth-based ages must be at least one year above
+    the model's starting age.
     """
 
+    # Labor moments
     min_age: int = 20
     max_age: int = 79
+    include_labor_profile: bool = True
+    labor_smoothing_window: int = 3
+    # Wealth-by-age profile (diagnostic by default)
+    include_wealth_profile: bool = False
     wealth_profile_min_age: int = 21
     wealth_profile_max_age: int = 79
+    wealth_profile_moment: WealthProfileMoment = "mean_normalized"
     wealth_anchor_min_age: int = 20
     wealth_anchor_max_age: int = 24
-    estimate_chi_n_min_age: int = 20
-    estimate_chi_n_max_age: int = 79
-    chi_n_tail_method: TailMethod = "scaled_default"
-    wealth_profile_moment: WealthProfileMoment = "anchor_window"
-    include_labor_profile: bool = True
-    include_wealth_profile: bool = True
-    include_income_gini: bool = True
-    include_savings_rate: bool = True
+    # Wealth distribution moments
     include_wealth_distribution: bool = True
+    include_wealth_gini: bool = False
+    include_wealth_var_log: bool = False
+    # Old-age wealth ratio (chi_b target)
+    include_old_age_wealth_ratio: bool = True
+    old_age_ratio_numerator_ages: tuple[int, int] = (75, 79)
+    old_age_ratio_denominator_ages: tuple[int, int] = (60, 64)
+    # Optional aggregate and inequality moments
+    include_bequest_to_output: bool = False
+    bequest_to_output_data: float | None = None
+    include_income_gini: bool = False
+    include_savings_rate: bool = False
     include_inheritance_moments: bool = False
     macro_year: int = 2025
+    # Data sources
     cps_years: tuple[int, ...] = (2023, 2022)
     scf_yrs_list: tuple[int, ...] = (2019,)
     cps_directory: str | None = None
     scf_directory: str | None = None
     scf_web: bool = False
     bootstrap_iterations: int = 1000
+    # chi_n handling for the legacy direct-estimation helpers
+    estimate_chi_n_min_age: int = 20
+    estimate_chi_n_max_age: int = 79
+    chi_n_tail_method: TailMethod = "scaled_default"
+    chi_n_n_spline_knots: int = 10
+    chi_n_spline_degree: int = 3
+    # SMM inference driver settings
     weighting_method: WeightingMethod = "identity"
     weighting_ridge: float = 1e-8
     n_starts: int = 3
@@ -77,8 +121,10 @@ class LifecycleCalibrationConfig:
     dfols_rhoend: float = 1e-6
     dfols_maxfun: int | None = None
     bound_epsilon: float = 1e-4
-    chi_n_n_spline_knots: int = 10
-    chi_n_spline_degree: int = 3
+    beta_annual_bounds: tuple[float, float] = (0.8, 0.999)
+    chi_b_bounds: tuple[float, float] = (0.1, 200.0)
+    chi_n_bounds: tuple[float, float] | None = None
+    failure_residual: float = 10.0
     moment_distance_method: MomentDistanceMethod = "relative"
     moment_distance_floor: float = 1e-8
     use_ss_solver_restart: bool = True
@@ -105,6 +151,18 @@ class LifecycleCalibrationConfig:
         )
 
     @property
+    def old_age_numerator_ages(self) -> np.ndarray:
+        """Return age labels in the old-age wealth ratio numerator."""
+        lo, hi = self.old_age_ratio_numerator_ages
+        return np.arange(lo, hi + 1)
+
+    @property
+    def old_age_denominator_ages(self) -> np.ndarray:
+        """Return age labels in the old-age wealth ratio denominator."""
+        lo, hi = self.old_age_ratio_denominator_ages
+        return np.arange(lo, hi + 1)
+
+    @property
     def estimated_chi_n_ages(self) -> np.ndarray:
         """Return the age labels for directly estimated chi_n values."""
         return np.arange(
@@ -116,33 +174,62 @@ class LifecycleCalibrationConfig:
         """Validate age and dimension settings against an OG-Core spec."""
         starting_age = int(getattr(p, "starting_age", 20))
         ending_age = int(getattr(p, "ending_age", 100))
-        model_ages = np.arange(starting_age, ending_age)
-        min_model_age = int(model_ages[0])
-        max_model_age = int(model_ages[-1])
-        requested_ages = np.concatenate(
-            [
-                self.moment_ages,
-                self.wealth_profile_ages,
-                self.wealth_anchor_ages,
-                self.estimated_chi_n_ages,
-            ]
-        )
-        if requested_ages.min() < min_model_age:
-            raise ValueError("Requested ages start before model ages.")
-        if requested_ages.max() > max_model_age:
-            raise ValueError("Requested ages extend beyond model ages.")
-        if self.estimate_chi_n_max_age < self.estimate_chi_n_min_age:
+        min_model_age = starting_age
+        max_model_age = ending_age - 1
+        for label, lo, hi in (
+            ("labor", self.min_age, self.max_age),
+            (
+                "wealth profile",
+                self.wealth_profile_min_age,
+                self.wealth_profile_max_age,
+            ),
+            (
+                "wealth anchor",
+                self.wealth_anchor_min_age,
+                self.wealth_anchor_max_age,
+            ),
+            (
+                "chi_n",
+                self.estimate_chi_n_min_age,
+                self.estimate_chi_n_max_age,
+            ),
+            ("old-age numerator", *self.old_age_ratio_numerator_ages),
+            ("old-age denominator", *self.old_age_ratio_denominator_ages),
+        ):
+            if hi < lo:
+                raise ValueError(f"{label} max age must be at least min age.")
+            if lo < min_model_age or hi > max_model_age:
+                raise ValueError(
+                    f"{label} ages [{lo}, {hi}] fall outside model ages "
+                    f"[{min_model_age}, {max_model_age}]."
+                )
+        # Wealth held at age a is b_sp1 chosen at a - 1, so a > starting_age.
+        wealth_age_sets = []
+        if self.include_wealth_profile:
+            wealth_age_sets.append(self.wealth_profile_ages)
+            if self.wealth_profile_moment == "anchor_window":
+                wealth_age_sets.append(self.wealth_anchor_ages)
+        if self.include_old_age_wealth_ratio:
+            wealth_age_sets.append(self.old_age_numerator_ages)
+            wealth_age_sets.append(self.old_age_denominator_ages)
+        if wealth_age_sets:
+            wealth_ages = np.concatenate(wealth_age_sets)
+            if wealth_ages.min() <= min_model_age:
+                raise ValueError(
+                    "Wealth-based ages must exceed the model starting age "
+                    "because wealth at age a is savings chosen at a - 1."
+                )
+        if self.labor_smoothing_window < 1:
+            raise ValueError("labor_smoothing_window must be at least 1.")
+        if self.include_bequest_to_output and (
+            self.bequest_to_output_data is None
+        ):
             raise ValueError(
-                "estimate_chi_n_max_age must be at least min age."
+                "bequest_to_output_data is required when "
+                "include_bequest_to_output is True."
             )
-        if self.max_age < self.min_age:
-            raise ValueError("max_age must be at least min_age.")
-        if self.wealth_profile_max_age < self.wealth_profile_min_age:
-            raise ValueError(
-                "wealth_profile_max_age must be at least min age."
-            )
-        if self.wealth_anchor_max_age < self.wealth_anchor_min_age:
-            raise ValueError("wealth_anchor_max_age must be at least min age.")
+        if self.failure_residual <= 0:
+            raise ValueError("failure_residual must be positive.")
 
 
 @dataclass(frozen=True)
@@ -157,6 +244,16 @@ class MomentSet:
         object.__setattr__(self, "values", values)
         if len(self.names) != values.size:
             raise ValueError("Moment names and values have different lengths.")
+
+    def to_frame(self, other: "MomentSet" | None = None) -> pd.DataFrame:
+        """Return the moments as a DataFrame, optionally beside another set."""
+        frame = pd.DataFrame({"moment": self.names, "value": self.values})
+        if other is not None:
+            if other.names != self.names:
+                raise ValueError("Moment sets are not aligned.")
+            frame = frame.rename(columns={"value": "data"})
+            frame["model"] = other.values
+        return frame
 
 
 @dataclass
@@ -196,6 +293,11 @@ class SSSolutionCache:
         self.previous_output = None
 
 
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
 def _as_vector(values) -> np.ndarray:
     """Return values as a one-dimensional float array."""
     return np.asarray(values, dtype=float).reshape(-1)
@@ -215,13 +317,64 @@ def _ss_chi_n(p) -> np.ndarray:
 
 
 def _age_to_index(age: int, p) -> int:
-    """Map an age label to its model age index."""
+    """Map an age label to the model age index of people at that age."""
     return int(age) - int(getattr(p, "starting_age", 20))
 
 
 def _age_indices(ages: np.ndarray, p) -> np.ndarray:
-    """Map age labels to model indices."""
+    """Map age labels to model indices for flow variables (n, c, y)."""
     return np.array([_age_to_index(age, p) for age in ages], dtype=int)
+
+
+def _wealth_age_indices(ages: np.ndarray, p) -> np.ndarray:
+    """Map age labels to ``b_sp1`` indices.
+
+    ``b_sp1[s, j]`` is savings chosen at model age index ``s`` and held at
+    the start of age index ``s + 1``.  Wealth observed in the data for people
+    of age ``a`` therefore corresponds to ``b_sp1[a - starting_age - 1]``.
+    """
+    idx = _age_indices(ages, p) - 1
+    if np.any(idx < 0):
+        raise ValueError(
+            "Wealth ages must exceed the model starting age by at least one."
+        )
+    return idx
+
+
+def _joint_pop_weights(p) -> np.ndarray:
+    """Return the (S, J) steady-state population distribution.
+
+    Newer OG-Core versions carry ``omega_SS`` as an (S, J) joint distribution
+    when demographics differ by lifetime-income type.  Older versions carry
+    a length-S vector, in which case the joint distribution is the outer
+    product with ``lambdas``.
+    """
+    omega = np.asarray(p.omega_SS, dtype=float)
+    lambdas = _lambdas(p)
+    if omega.ndim == 2:
+        return omega
+    return omega.reshape(-1, 1) * lambdas.reshape(1, -1)
+
+
+def _type_weights_by_age(p) -> np.ndarray:
+    """Return (S, J) weights of each type within each age, summing to one."""
+    joint = _joint_pop_weights(p)
+    totals = joint.sum(axis=1, keepdims=True)
+    totals = np.where(totals > 0, totals, 1.0)
+    return joint / totals
+
+
+def _smooth_profile(values: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving average with shrinking windows at the edges."""
+    values = np.asarray(values, dtype=float)
+    if window <= 1 or values.size == 0:
+        return values.copy()
+    return (
+        pd.Series(values)
+        .rolling(window=int(window), center=True, min_periods=1)
+        .mean()
+        .to_numpy(dtype=float)
+    )
 
 
 def _build_chi_n_spline_basis(
@@ -320,6 +473,20 @@ def _weighted_mean_by_age(
     return profile.reindex(ages).to_numpy(dtype=float)
 
 
+def _weighted_mean_in_age_range(
+    data: pd.DataFrame,
+    value_col: str,
+    weight_col: str,
+    ages: np.ndarray,
+    age_col: str = "age",
+) -> float:
+    """Weighted mean of a column over all observations with age in ages."""
+    subset = data[[age_col, value_col, weight_col]].copy()
+    subset[age_col] = pd.to_numeric(subset[age_col], errors="coerce")
+    subset = subset[subset[age_col].isin(ages)]
+    return _weighted_mean(subset[value_col], subset[weight_col])
+
+
 def _require_finite(values: np.ndarray, label: str) -> np.ndarray:
     """Validate that all values are finite."""
     values = np.asarray(values, dtype=float)
@@ -352,39 +519,118 @@ def _normalize_wealth_profile(
     raise ValueError(f"Unsupported wealth profile moment: {method}")
 
 
-def _wealth_distribution_moment_names() -> tuple[str, ...]:
-    """Return names for the nine SCF/model wealth distribution moments."""
-    return (
-        "wealth_share_0_25",
-        "wealth_share_25_50",
-        "wealth_share_50_70",
-        "wealth_share_70_80",
-        "wealth_share_80_90",
-        "wealth_share_90_99",
-        "wealth_share_99_100",
-        "wealth_gini",
-        "wealth_var_log",
+# ---------------------------------------------------------------------------
+# Wealth distribution moments (bins from lambdas)
+# ---------------------------------------------------------------------------
+
+
+def _percent_label(share: float) -> str:
+    """Format a cumulative population share as a percentile label."""
+    pct = 100.0 * share
+    text = f"{pct:.4f}".rstrip("0").rstrip(".")
+    return text.replace(".", "p")
+
+
+def wealth_share_bin_names(lambdas) -> tuple[str, ...]:
+    """Return one wealth-share moment name per lifetime-income bin.
+
+    Bins are cumulative population shares of ``lambdas``; for the default
+    ten OG-USA types the names run from ``wealth_share_0_25`` through
+    ``wealth_share_99p99_100``.
+    """
+    cum = np.concatenate([[0.0], np.cumsum(_as_vector(lambdas))])
+    cum[-1] = 1.0
+    return tuple(
+        f"wealth_share_{_percent_label(lo)}_{_percent_label(hi)}"
+        for lo, hi in zip(cum[:-1], cum[1:])
     )
 
 
-def _model_wealth_distribution_moments(ss_output: dict, p) -> np.ndarray:
-    """Compute the model moments matching wealth.compute_wealth_moments."""
+def _wealth_distribution_moment_names(
+    lambdas,
+    include_gini: bool = False,
+    include_var_log: bool = False,
+) -> tuple[str, ...]:
+    """Return names for the wealth distribution moments in order."""
+    names = list(wealth_share_bin_names(lambdas))
+    if include_gini:
+        names.append("wealth_gini")
+    if include_var_log:
+        names.append("wealth_var_log")
+    return tuple(names)
+
+
+def _living_wealth_distribution(ss_output: dict, p):
+    """Return wealth held by living households and matching weights.
+
+    ``b_sp1[s]`` is held at age index ``s + 1``, so the last row is wealth
+    carried out of the model at death rather than held by anyone alive.  The
+    distribution therefore pairs ``b_sp1[:-1]`` with population weights for
+    age indices ``1`` through ``S - 1``.
+    """
     b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
-    wealth_ineq = Inequality(b_sp1, p.omega_SS, _lambdas(p), p.S, p.J)
-    return np.array(
-        [
-            1 - wealth_ineq.top_share(0.75),
-            wealth_ineq.top_share(0.75) - wealth_ineq.top_share(0.50),
-            wealth_ineq.top_share(0.50) - wealth_ineq.top_share(0.30),
-            wealth_ineq.top_share(0.30) - wealth_ineq.top_share(0.20),
-            wealth_ineq.top_share(0.20) - wealth_ineq.top_share(0.10),
-            wealth_ineq.top_share(0.10) - wealth_ineq.top_share(0.01),
-            wealth_ineq.top_share(0.01),
-            wealth_ineq.gini(),
-            wealth_ineq.var_of_logs(),
-        ],
-        dtype=float,
-    )
+    joint = _joint_pop_weights(p)
+    return b_sp1[:-1, :], joint[1:, :]
+
+
+def model_wealth_shares(ss_output: dict, p) -> np.ndarray:
+    """Compute the share of wealth held by each lambdas bin in the model.
+
+    Percentile cutoffs are cumulative ``p.lambdas``.  Because all households
+    (not only those in type ``j``) are sorted by wealth, the bin for type
+    ``j`` is a population percentile bin, exactly as in the SCF data moment
+    from :func:`ogusa.wealth.compute_wealth_moments`.
+    """
+    lambdas = _lambdas(p)
+    dist, weights = _living_wealth_distribution(ss_output, p)
+    ineq = Inequality(dist, weights, lambdas, dist.shape[0], p.J)
+    cum = np.cumsum(lambdas)
+    top = np.array([ineq.top_share(1.0 - c) for c in cum[:-1]])
+    shares = np.empty(lambdas.size)
+    if lambdas.size == 1:
+        shares[0] = 1.0
+        return shares
+    shares[0] = 1.0 - top[0]
+    shares[1:-1] = top[:-1] - top[1:]
+    shares[-1] = top[-1]
+    return shares
+
+
+def _model_wealth_distribution_moments(
+    ss_output: dict,
+    p,
+    config: LifecycleCalibrationConfig,
+) -> np.ndarray:
+    """Compute model wealth shares plus optional Gini and var(log)."""
+    values = list(model_wealth_shares(ss_output, p))
+    if config.include_wealth_gini or config.include_wealth_var_log:
+        dist, weights = _living_wealth_distribution(ss_output, p)
+        ineq = Inequality(dist, weights, _lambdas(p), dist.shape[0], p.J)
+        if config.include_wealth_gini:
+            values.append(ineq.gini())
+        if config.include_wealth_var_log:
+            values.append(ineq.var_of_logs())
+    return np.asarray(values, dtype=float)
+
+
+def _data_wealth_distribution_moments(
+    scf: pd.DataFrame,
+    p,
+    config: LifecycleCalibrationConfig,
+) -> np.ndarray:
+    """Compute SCF wealth shares (bins from lambdas) plus optional extras."""
+    raw = wealth.compute_wealth_moments(scf.copy(), _lambdas(p))
+    shares = list(raw[: p.J])
+    if config.include_wealth_gini:
+        shares.append(raw[-2])
+    if config.include_wealth_var_log:
+        shares.append(raw[-1])
+    return np.asarray(shares, dtype=float)
+
+
+# ---------------------------------------------------------------------------
+# Data loading and data moments
+# ---------------------------------------------------------------------------
 
 
 def load_cps_hours_data(
@@ -415,13 +661,21 @@ def labor_profile_from_cps(
     cps: pd.DataFrame,
     config: LifecycleCalibrationConfig,
 ) -> np.ndarray:
-    """Compute labor supply by age from CPS data."""
+    """Compute mean hours by age from CPS data as a share of the endowment.
+
+    Hours include non-workers (zero hours), so the profile is aggregate labor
+    input per person, matching the model's ``n``.  A centered moving average
+    of width ``config.labor_smoothing_window`` is applied so sampling noise
+    in single-year cells is not carried into ``chi_n``.
+    """
     cps = cps.copy()
     if "hours" not in cps:
         if "hours_per_week" in cps:
             cps["hours"] = cps["hours_per_week"]
         else:
             raise ValueError("CPS data must include hours or hours_per_week.")
+    cps["hours"] = pd.to_numeric(cps["hours"], errors="coerce").fillna(0.0)
+    cps.loc[cps["hours"] < 0, "hours"] = 0.0
     weight_col = None
     for possible_weight in ("weight", "wtsupp", "s006", "wgt"):
         if possible_weight in cps:
@@ -433,7 +687,8 @@ def labor_profile_from_cps(
         weight_col,
         config.moment_ages,
     )
-    labor = hours / ((24 - 8) * 7)  # scale so fraction of time endowment
+    labor = hours / HOURS_IN_TIME_ENDOWMENT
+    labor = _smooth_profile(labor, config.labor_smoothing_window)
     return _require_finite(labor, "labor profile")
 
 
@@ -441,25 +696,83 @@ def wealth_profile_from_scf(
     scf: pd.DataFrame,
     config: LifecycleCalibrationConfig,
 ) -> np.ndarray:
-    """Compute net-wealth age profile moments from SCF data."""
+    """Compute the (normalized) net-wealth age profile from SCF data."""
     profile = _weighted_mean_by_age(
         scf,
         "networth_infadj",
         "wgt",
         config.wealth_profile_ages,
     )
-    anchor_profile = _weighted_mean_by_age(
-        scf,
-        "networth_infadj",
-        "wgt",
-        config.wealth_anchor_ages,
-    )
+    anchor_profile = None
+    if config.wealth_profile_moment == "anchor_window":
+        anchor_profile = _weighted_mean_by_age(
+            scf,
+            "networth_infadj",
+            "wgt",
+            config.wealth_anchor_ages,
+        )
     profile = _normalize_wealth_profile(
         profile,
         anchor_profile,
         config.wealth_profile_moment,
     )
     return _require_finite(profile, "wealth profile")
+
+
+def old_age_ratio_moment_name(config: LifecycleCalibrationConfig) -> str:
+    """Return the moment name for the old-age wealth ratio."""
+    n_lo, n_hi = config.old_age_ratio_numerator_ages
+    d_lo, d_hi = config.old_age_ratio_denominator_ages
+    return f"old_age_wealth_ratio_{n_lo}_{n_hi}_over_{d_lo}_{d_hi}"
+
+
+def old_age_wealth_ratio_from_scf(
+    scf: pd.DataFrame,
+    config: LifecycleCalibrationConfig,
+) -> float:
+    """Mean SCF net worth in the numerator ages over the denominator ages.
+
+    Both means are survey-weighted over all households in the age range, so
+    the ratio is population weighted across ages as well as within them.
+    """
+    numerator = _weighted_mean_in_age_range(
+        scf, "networth_infadj", "wgt", config.old_age_numerator_ages
+    )
+    denominator = _weighted_mean_in_age_range(
+        scf, "networth_infadj", "wgt", config.old_age_denominator_ages
+    )
+    if not np.isfinite(denominator) or np.isclose(denominator, 0.0):
+        raise ValueError("Old-age wealth ratio denominator is zero.")
+    return float(numerator / denominator)
+
+
+def model_old_age_wealth_ratio(
+    ss_output: dict,
+    p,
+    config: LifecycleCalibrationConfig,
+) -> float:
+    """Population-weighted mean wealth at old ages over pre-retirement ages."""
+    b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
+    joint = _joint_pop_weights(p)
+
+    def _mean_wealth(ages):
+        hold_idx = _age_indices(ages, p)
+        save_idx = _wealth_age_indices(ages, p)
+        weights = joint[hold_idx, :]
+        return (b_sp1[save_idx, :] * weights).sum() / weights.sum()
+
+    denominator = _mean_wealth(config.old_age_denominator_ages)
+    if np.isclose(denominator, 0.0):
+        raise ValueError("Model old-age wealth ratio denominator is zero.")
+    return float(_mean_wealth(config.old_age_numerator_ages) / denominator)
+
+
+def model_bequest_to_output(ss_output: dict, p) -> float:
+    """Aggregate bequests over GDP in the model steady state."""
+    output = float(ss_output["Y"])
+    if np.isclose(output, 0.0):
+        raise ValueError("Cannot compute bequests over output with Y = 0.")
+    return float(np.sum(np.asarray(ss_output["BQ"], dtype=float)) / output)
 
 
 def income_gini_data_moment(
@@ -556,12 +869,25 @@ def compute_data_moments(
     inheritance_moments: MomentSet | None = None,
     savings_rate: float | None = None,
 ) -> MomentSet:
-    """Compute the stacked data moment vector for the SMM objective."""
+    """Compute the stacked data moment vector.
+
+    Moment order: labor profile, wealth profile, income Gini, savings rate,
+    wealth distribution, old-age wealth ratio, bequests over output,
+    inheritance moments.  :func:`compute_model_moments` uses the same order.
+    """
     if config is None:
         config = LifecycleCalibrationConfig()
     config.validate(p)
     names: list[str] = []
     values: list[float] = []
+
+    needs_scf = (
+        config.include_wealth_profile
+        or config.include_wealth_distribution
+        or config.include_old_age_wealth_ratio
+    )
+    if needs_scf and scf is None:
+        scf = load_scf_wealth_data(config)
 
     if config.include_labor_profile:
         if cps is None:
@@ -571,8 +897,6 @@ def compute_data_moments(
         values.extend(labor)
 
     if config.include_wealth_profile:
-        if scf is None:
-            scf = load_scf_wealth_data(config)
         wealth_profile = wealth_profile_from_scf(scf, config)
         names.extend(
             f"net_wealth_age_{age}" for age in config.wealth_profile_ages
@@ -590,14 +914,22 @@ def compute_data_moments(
         values.append(float(savings_rate))
 
     if config.include_wealth_distribution:
-        if scf is None:
-            scf = load_scf_wealth_data(config)
-        wealth_dist = wealth.compute_wealth_moments(
-            scf.copy(),
-            WEALTH_MOMENT_BIN_WEIGHTS,
+        names.extend(
+            _wealth_distribution_moment_names(
+                _lambdas(p),
+                config.include_wealth_gini,
+                config.include_wealth_var_log,
+            )
         )
-        names.extend(_wealth_distribution_moment_names())
-        values.extend(wealth_dist)
+        values.extend(_data_wealth_distribution_moments(scf, p, config))
+
+    if config.include_old_age_wealth_ratio:
+        names.append(old_age_ratio_moment_name(config))
+        values.append(old_age_wealth_ratio_from_scf(scf, config))
+
+    if config.include_bequest_to_output:
+        names.append("bequest_to_output")
+        values.append(float(config.bequest_to_output_data))
 
     if config.include_inheritance_moments:
         if inheritance_moments is None:
@@ -621,31 +953,34 @@ def compute_model_moments(
     if config is None:
         config = LifecycleCalibrationConfig()
     config.validate(p)
-    lambdas = _lambdas(p)
+    type_weights = _type_weights_by_age(p)
     names: list[str] = []
     values: list[float] = []
 
     if config.include_labor_profile:
         age_idx = _age_indices(config.moment_ages, p)
         n = np.asarray(ss_output["n"], dtype=float)
-        labor = (n[age_idx, :] * lambdas.reshape(1, p.J)).sum(axis=1)
+        labor = (n[age_idx, :] * type_weights[age_idx, :]).sum(axis=1)
         names.extend(f"labor_supply_age_{age}" for age in config.moment_ages)
         values.extend(labor)
 
     if config.include_wealth_profile:
-        wealth_age_idx = _age_indices(config.wealth_profile_ages, p)
-        anchor_age_idx = _age_indices(config.wealth_anchor_ages, p)
         b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
         factor = float(ss_output.get("factor", 1.0))
-        wealth_profile = (
-            b_sp1[wealth_age_idx, :] * factor * lambdas.reshape(1, p.J)
-        ).sum(axis=1)
-        anchor_profile = (
-            b_sp1[anchor_age_idx, :] * factor * lambdas.reshape(1, p.J)
-        ).sum(axis=1)
+
+        def _profile(ages):
+            hold_idx = _age_indices(ages, p)
+            save_idx = _wealth_age_indices(ages, p)
+            return (
+                b_sp1[save_idx, :] * factor * type_weights[hold_idx, :]
+            ).sum(axis=1)
+
+        anchor = None
+        if config.wealth_profile_moment == "anchor_window":
+            anchor = _profile(config.wealth_anchor_ages)
         wealth_profile = _normalize_wealth_profile(
-            wealth_profile,
-            anchor_profile,
+            _profile(config.wealth_profile_ages),
+            anchor,
             config.wealth_profile_moment,
         )
         names.extend(
@@ -655,7 +990,9 @@ def compute_model_moments(
 
     if config.include_income_gini:
         income = np.asarray(ss_output["before_tax_income"], dtype=float)
-        income_ineq = Inequality(income, p.omega_SS, lambdas, p.S, p.J)
+        income_ineq = Inequality(
+            income, _joint_pop_weights(p), _lambdas(p), p.S, p.J
+        )
         names.append("income_gini")
         values.append(income_ineq.gini())
 
@@ -664,8 +1001,22 @@ def compute_model_moments(
         values.append(model_savings_rate_moment(ss_output, p))
 
     if config.include_wealth_distribution:
-        names.extend(_wealth_distribution_moment_names())
-        values.extend(_model_wealth_distribution_moments(ss_output, p))
+        names.extend(
+            _wealth_distribution_moment_names(
+                _lambdas(p),
+                config.include_wealth_gini,
+                config.include_wealth_var_log,
+            )
+        )
+        values.extend(_model_wealth_distribution_moments(ss_output, p, config))
+
+    if config.include_old_age_wealth_ratio:
+        names.append(old_age_ratio_moment_name(config))
+        values.append(model_old_age_wealth_ratio(ss_output, p, config))
+
+    if config.include_bequest_to_output:
+        names.append("bequest_to_output")
+        values.append(model_bequest_to_output(ss_output, p))
 
     if config.include_inheritance_moments:
         if inheritance_moments is None:
@@ -677,6 +1028,11 @@ def compute_model_moments(
         values.extend(inheritance_moments.values)
 
     return MomentSet(tuple(names), np.asarray(values, dtype=float))
+
+
+# ---------------------------------------------------------------------------
+# Parameter packing for the SMM inference driver
+# ---------------------------------------------------------------------------
 
 
 def build_chi_n_profile(
@@ -856,6 +1212,76 @@ def apply_lifecycle_params(
     )
 
 
+# ---------------------------------------------------------------------------
+# Steady-state solves
+# ---------------------------------------------------------------------------
+
+_SS_WARM_START_ERRORS = (
+    AssertionError,
+    FloatingPointError,
+    KeyError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
+
+
+def _ss_solver_kwargs(previous: dict, p, client) -> dict:
+    """Build keyword arguments for ``SS.SS_solver`` from a prior solution.
+
+    The solver's positional signature has changed across OG-Core releases
+    (a ``G`` argument was added), so arguments are matched by name against
+    the installed signature.  Missing required arguments raise ``TypeError``
+    rather than being misassigned positionally.
+    """
+    signature = inspect.signature(SS.SS_solver).parameters
+    ig_baseline = (
+        previous.get("I_g") if getattr(p, "baseline_spending", False) else None
+    )
+    candidates = {
+        "bmat": previous["b_sp1"],
+        "nmat": previous["n"],
+        "r_p": float(previous["r_p"]),
+        "r": float(previous["r"]),
+        "w": float(previous["w"]),
+        "p_m": previous["p_m"],
+        "Y": float(previous["Y"]),
+        "BQ": previous["BQ"],
+        "TR": float(previous["TR"]),
+        "Ig_baseline": ig_baseline,
+        "factor": float(previous["factor"]),
+        "p": p,
+        "client": client,
+    }
+    if "G" in signature and "G" in previous:
+        candidates["G"] = float(previous["G"])
+    accepts_var_keywords = any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in signature.values()
+    )
+    if accepts_var_keywords:
+        kwargs = dict(candidates)
+    else:
+        kwargs = {k: v for k, v in candidates.items() if k in signature}
+    named_kinds = (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
+    missing = [
+        name
+        for name, param in signature.items()
+        if param.kind in named_kinds
+        and param.default is inspect.Parameter.empty
+        and name not in kwargs
+    ]
+    if missing:
+        raise TypeError(
+            "Cannot warm start SS.SS_solver; missing required arguments: "
+            + ", ".join(missing)
+        )
+    return kwargs
+
+
 def solve_ss_with_cache(
     p,
     client=None,
@@ -865,52 +1291,39 @@ def solve_ss_with_cache(
     Solve SS, optionally warm-starting from the previous SS output.
 
     The direct SS_solver path keeps p.baseline unchanged, so baseline solves
-    still update the model scaling factor.  If the warm start fails, fall back
-    to SS.run_SS and refresh the cache with that solution.
+    still update the model scaling factor.  If the warm start fails, a
+    warning is logged and the solve falls back to SS.run_SS, refreshing the
+    cache with that solution.
     """
     use_cache = (
         ss_cache is not None
         and ss_cache.use_ss_solver
         and ss_cache.previous_output is not None
     )
+    ss_output = None
     if use_cache:
-        previous = ss_cache.previous_output
         try:
-            ig_baseline = (
-                previous.get("I_g")
-                if getattr(p, "baseline_spending", False)
-                else None
+            kwargs = _ss_solver_kwargs(ss_cache.previous_output, p, client)
+            ss_output = SS.SS_solver(**kwargs)
+        except _SS_WARM_START_ERRORS as err:
+            logger.warning(
+                "SS warm start failed (%s: %s); falling back to a cold "
+                "SS.run_SS solve.",
+                type(err).__name__,
+                err,
             )
-            ss_output = SS.SS_solver(
-                previous["b_sp1"],
-                previous["n"],
-                float(previous["r_p"]),
-                float(previous["r"]),
-                float(previous["w"]),
-                previous["p_m"],
-                float(previous["Y"]),
-                previous["BQ"],
-                float(previous["TR"]),
-                ig_baseline,
-                float(previous["factor"]),
-                p,
-                client,
-            )
-        except (
-            AssertionError,
-            FloatingPointError,
-            KeyError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ):
-            ss_output = SS.run_SS(p, client=client)
-    else:
+            ss_output = None
+    if ss_output is None:
         ss_output = SS.run_SS(p, client=client)
 
     if ss_cache is not None:
         ss_cache.previous_output = ss_output
     return ss_output
+
+
+# ---------------------------------------------------------------------------
+# Weighting, distance, and the SMM inference driver
+# ---------------------------------------------------------------------------
 
 
 def weighting_matrix(
@@ -948,14 +1361,24 @@ def bootstrap_data_moments(
     seed: int | None = None,
     savings_rate: float | None = None,
 ) -> np.ndarray:
-    """Bootstrap the data moments available from CPS and SCF microdata."""
+    """Bootstrap the data moments available from CPS and SCF microdata.
+
+    Moments that do not come from the CPS or SCF microdata (income Gini,
+    savings rate, bequests over output, inheritance moments) are held at
+    their point values.  Rows are resampled independently; SCF implicates
+    of the same household are therefore treated as independent draws, which
+    understates the sampling variance somewhat.
+    """
     if config is None:
         config = LifecycleCalibrationConfig()
     if cps is None and config.include_labor_profile:
         cps = load_cps_hours_data(config.cps_years, config.cps_directory)
-    if scf is None and (
-        config.include_wealth_profile or config.include_wealth_distribution
-    ):
+    needs_scf = (
+        config.include_wealth_profile
+        or config.include_wealth_distribution
+        or config.include_old_age_wealth_ratio
+    )
+    if scf is None and needs_scf:
         scf = load_scf_wealth_data(config)
 
     point_moments = compute_data_moments(
@@ -969,6 +1392,7 @@ def bootstrap_data_moments(
         config,
         include_income_gini=False,
         include_savings_rate=False,
+        include_bequest_to_output=False,
         include_inheritance_moments=False,
     )
     rng = np.random.default_rng(seed)
@@ -1000,6 +1424,25 @@ def bootstrap_data_moments(
     return boot
 
 
+def moment_residuals(
+    model_moments: MomentSet,
+    data_moments: MomentSet,
+    method: MomentDistanceMethod = "relative",
+    floor: float = 1e-8,
+) -> np.ndarray:
+    """Return model-minus-data residuals, optionally relative to the data."""
+    if model_moments.names != data_moments.names:
+        raise ValueError("Model and data moments are not aligned.")
+    m = model_moments.values
+    d = data_moments.values
+    if method == "relative":
+        safe_denom = np.where(np.abs(d) > floor, np.abs(d), floor)
+        return (m - d) / safe_denom
+    if method == "absolute":
+        return m - d
+    raise ValueError(f"Unsupported moment distance method: {method}")
+
+
 def smm_distance(
     model_moments: MomentSet,
     data_moments: MomentSet,
@@ -1020,70 +1463,10 @@ def smm_distance(
             method="relative", preventing division by zero for near-zero
             moments such as bottom wealth shares.
     """
-    if model_moments.names != data_moments.names:
-        raise ValueError("Model and data moments are not aligned.")
-    m = model_moments.values
-    d = data_moments.values
-    if method == "relative":
-        safe_denom = np.where(np.abs(d) > floor, np.abs(d), floor)
-        diff = (m - d) / safe_denom
-    else:
-        diff = m - d
+    diff = moment_residuals(model_moments, data_moments, method, floor)
     if not np.all(np.isfinite(diff)):
         return np.inf
     return float(diff.T @ W @ diff)
-
-
-def smm_objective(
-    theta: np.ndarray,
-    data_moments: MomentSet,
-    W: np.ndarray,
-    p,
-    config: LifecycleCalibrationConfig | None = None,
-    base_chi_n: np.ndarray | None = None,
-    client=None,
-    transform: bool = True,
-    ss_cache: SSSolutionCache | None = None,
-) -> float:
-    """Evaluate the joint lifecycle SMM objective."""
-    if config is None:
-        config = LifecycleCalibrationConfig()
-    if base_chi_n is None:
-        base_chi_n = _ss_chi_n(p)
-    try:
-        params = unpack_lifecycle_params(
-            theta,
-            p,
-            config,
-            base_chi_n=base_chi_n,
-            transform=transform,
-        )
-        apply_lifecycle_params(
-            p,
-            params["beta_annual"],
-            params["chi_b"],
-            params["chi_n"],
-        )
-        ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
-        model_moments = compute_model_moments(ss_output, p, config)
-        distance = smm_distance(
-            model_moments,
-            data_moments,
-            W,
-            method=config.moment_distance_method,
-            floor=config.moment_distance_floor,
-        )
-    except (
-        AssertionError,
-        FloatingPointError,
-        ValueError,
-        RuntimeError,
-        KeyError,
-    ):
-        distance = np.inf
-    if not np.isfinite(distance):
-        return 1e30
-    return distance
 
 
 def _apply_weight_sqrt(residuals: np.ndarray, W: np.ndarray) -> np.ndarray:
@@ -1102,6 +1485,68 @@ def _apply_weight_sqrt(residuals: np.ndarray, W: np.ndarray) -> np.ndarray:
         return np.sqrt(np.maximum(np.diag(W), 0.0)) * residuals
 
 
+def _evaluate_model_moments(
+    theta: np.ndarray,
+    p,
+    config: LifecycleCalibrationConfig,
+    base_chi_n: np.ndarray | None,
+    client,
+    transform: bool,
+    ss_cache: SSSolutionCache | None,
+) -> MomentSet:
+    """Apply theta to p, solve the SS, and return model moments."""
+    params = unpack_lifecycle_params(
+        theta, p, config, base_chi_n=base_chi_n, transform=transform
+    )
+    apply_lifecycle_params(
+        p, params["beta_annual"], params["chi_b"], params["chi_n"]
+    )
+    ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
+    return compute_model_moments(ss_output, p, config)
+
+
+def smm_objective(
+    theta: np.ndarray,
+    data_moments: MomentSet,
+    W: np.ndarray,
+    p,
+    config: LifecycleCalibrationConfig | None = None,
+    base_chi_n: np.ndarray | None = None,
+    client=None,
+    transform: bool = True,
+    ss_cache: SSSolutionCache | None = None,
+) -> float:
+    """Evaluate the joint lifecycle SMM objective.
+
+    On solver failure returns the objective implied by a residual vector of
+    ``config.failure_residual`` in every moment, so failed regions look bad
+    to the optimizer without producing astronomically large values.
+    """
+    if config is None:
+        config = LifecycleCalibrationConfig()
+    if base_chi_n is None:
+        base_chi_n = _ss_chi_n(p)
+    n_moments = data_moments.values.size
+    penalty = float(n_moments) * config.failure_residual**2
+    try:
+        model_moments = _evaluate_model_moments(
+            theta, p, config, base_chi_n, client, transform, ss_cache
+        )
+        distance = smm_distance(
+            model_moments,
+            data_moments,
+            W,
+            method=config.moment_distance_method,
+            floor=config.moment_distance_floor,
+        )
+    except _SS_WARM_START_ERRORS as err:
+        logger.warning("SMM objective evaluation failed: %s", err)
+        return penalty
+    if not np.isfinite(distance):
+        return penalty
+    return float(min(distance, penalty))
+
+
 def smm_residual(
     theta: np.ndarray,
     data_moments: MomentSet,
@@ -1117,97 +1562,103 @@ def smm_residual(
 
     DFO-LS minimises ``||f(x)||^2``.  Pre-multiplying by ``W^{1/2}`` ensures
     that ``||result||^2 == r^T W r``, matching the SMM objective.  On solver
-    failure returns a large constant vector so DFO-LS avoids that region.
+    failure returns a vector of ``config.failure_residual`` so the optimizer
+    avoids that region without the interpolation model being poisoned by
+    enormous values.
     """
     n_moments = data_moments.values.size
+    penalty = np.full(n_moments, config.failure_residual)
     try:
-        params = unpack_lifecycle_params(
-            theta, p, config, base_chi_n=base_chi_n, transform=transform
+        model_moments = _evaluate_model_moments(
+            theta, p, config, base_chi_n, client, transform, ss_cache
         )
-        apply_lifecycle_params(
-            p, params["beta_annual"], params["chi_b"], params["chi_n"]
+        residuals = moment_residuals(
+            model_moments,
+            data_moments,
+            config.moment_distance_method,
+            config.moment_distance_floor,
         )
-        ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
-        model_moments = compute_model_moments(ss_output, p, config)
-        m = model_moments.values
-        d = data_moments.values
-        if config.moment_distance_method == "relative":
-            safe_denom = np.where(
-                np.abs(d) > config.moment_distance_floor,
-                np.abs(d),
-                config.moment_distance_floor,
-            )
-            residuals = (m - d) / safe_denom
-        else:
-            residuals = m - d
         weighted = _apply_weight_sqrt(residuals, W)
-        if not np.all(np.isfinite(weighted)):
-            return np.full(n_moments, 1e15)
-        return weighted
-    except (
-        AssertionError,
-        FloatingPointError,
-        KeyError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ):
-        return np.full(n_moments, 1e15)
+    except _SS_WARM_START_ERRORS as err:
+        logger.warning("SMM residual evaluation failed: %s", err)
+        return penalty
+    if not np.all(np.isfinite(weighted)):
+        return penalty
+    return np.clip(weighted, -config.failure_residual, config.failure_residual)
+
+
+def _validator_range(p, param_name: str) -> tuple[float, float]:
+    """Return the ParamTools range validator bounds for a parameter."""
+    data = getattr(p, "_data", {})
+    validators = data.get(param_name, {}).get("validators", {})
+    value_range = validators.get("range", {})
+    lo = float(value_range.get("min", -np.inf))
+    hi = float(value_range.get("max", np.inf))
+    return lo, hi
+
+
+def _intersect_bounds(
+    validator_bounds: tuple[float, float],
+    config_bounds: tuple[float, float] | None,
+) -> tuple[float, float]:
+    """Intersect validator bounds with optional tighter config bounds."""
+    lo, hi = validator_bounds
+    if config_bounds is not None:
+        lo = max(lo, float(config_bounds[0]))
+        hi = min(hi, float(config_bounds[1]))
+    if not hi > lo:
+        raise ValueError(f"Empty parameter bounds: [{lo}, {hi}].")
+    return lo, hi
 
 
 def _extract_dfols_bounds(
     p,
     config: LifecycleCalibrationConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Build DFO-LS bound arrays from the ParamTools validators in p.
+    """Build DFO-LS bound arrays in the transformed parameter space.
 
-    Bounds are read from ``p._data[param]['validators']['range']`` and then
-    mapped into the same transformed space used by the optimizer:
+    Natural bounds are the intersection of the ParamTools range validators
+    on ``p`` with the (optional, tighter) bounds in ``config``.  They are
+    then mapped into the optimizer's space:
 
-    * ``beta_annual`` — logit transform; validator min/max become the
-      logit of the natural bounds (with ``bound_epsilon`` as a floor so
-      log(0) is avoided).
-    * ``chi_b`` — log transform; same epsilon floor on the natural minimum.
-    * ``chi_n`` spline ``gamma`` — the B-spline has the convex-hull
-      property: if every coefficient satisfies
-      ``log(chi_n_min) ≤ γᵢ ≤ log(chi_n_max)`` then the evaluated
-      ``chi_n = exp(B @ gamma)`` is guaranteed to stay within
-      ``[chi_n_min, chi_n_max]`` at every model age.
+    * ``beta_annual`` uses a logit transform, with ``bound_epsilon`` keeping
+      the natural bounds strictly inside (0, 1).
+    * ``chi_b`` uses a log transform with the same epsilon floor.
+    * ``chi_n`` spline coefficients ``gamma`` are bounded by
+      ``log(chi_n_min)`` and ``log(chi_n_max)``.  By the convex-hull property
+      of B-splines this keeps ``chi_n = exp(B @ gamma)`` inside the natural
+      bounds at every age.
 
     Returns:
-        lower: 1-D array of length n_beta + n_chi_b + n_gamma.
+        lower: 1-D array of length 2J + n_gamma.
         upper: 1-D array of the same length.
     """
     eps = config.bound_epsilon
 
-    def _range(param_name):
-        validators = p._data.get(param_name, {}).get("validators", {})
-        r = validators.get("range", {})
-        lo = float(r.get("min", -np.inf))
-        hi = float(r.get("max", np.inf))
-        return lo, hi
+    b_lo, b_hi = _intersect_bounds(
+        _validator_range(p, "beta_annual"), config.beta_annual_bounds
+    )
+    b_lo = max(b_lo, eps)
+    b_hi = min(b_hi, 1.0 - eps)
+    beta_lo = np.full(p.J, np.log(b_lo / (1.0 - b_lo)))
+    beta_hi = np.full(p.J, np.log(b_hi / (1.0 - b_hi)))
 
-    # --- beta_annual (logit space) ---
-    b_lo_nat, b_hi_nat = _range("beta_annual")
-    b_lo_nat = max(b_lo_nat, eps)
-    b_hi_nat = min(b_hi_nat, 1.0 - eps)
-    beta_lo = np.full(p.J, np.log(b_lo_nat / (1.0 - b_lo_nat)))
-    beta_hi = np.full(p.J, np.log(b_hi_nat / (1.0 - b_hi_nat)))
+    cb_lo, cb_hi = _intersect_bounds(
+        _validator_range(p, "chi_b"), config.chi_b_bounds
+    )
+    cb_lo = max(cb_lo, eps)
+    chi_b_lo = np.full(p.J, np.log(cb_lo))
+    chi_b_hi = np.full(p.J, np.log(cb_hi))
 
-    # --- chi_b (log space) ---
-    cb_lo_nat, cb_hi_nat = _range("chi_b")
-    cb_lo_nat = max(cb_lo_nat, eps)
-    chi_b_lo = np.full(p.J, np.log(cb_lo_nat))
-    chi_b_hi = np.full(p.J, np.log(cb_hi_nat))
+    cn_lo, cn_hi = _intersect_bounds(
+        _validator_range(p, "chi_n"), config.chi_n_bounds
+    )
+    cn_lo = max(cn_lo, eps)
+    gamma_lo = np.full(config.chi_n_n_spline_knots, np.log(cn_lo))
+    gamma_hi = np.full(config.chi_n_n_spline_knots, np.log(cn_hi))
 
-    # --- chi_n spline coefficients (log space, convex-hull argument) ---
-    cn_lo_nat, cn_hi_nat = _range("chi_n")
-    cn_lo_nat = max(cn_lo_nat, eps)
-    gamma_lo = np.full(config.chi_n_n_spline_knots, np.log(cn_lo_nat))
-    gamma_hi = np.full(config.chi_n_n_spline_knots, np.log(cn_hi_nat))
-
-    lower = np.concatenate([0.8, 0.1, gamma_lo])
-    upper = np.concatenate([0.999, 200, gamma_hi])  # TODO: check if want to divide in half, but want to keep away from parameter range extremes as it keeps hitting in the optimization routine even with these bounds
+    lower = np.concatenate([beta_lo, chi_b_lo, gamma_lo])
+    upper = np.concatenate([beta_hi, chi_b_hi, gamma_hi])
     return lower, upper
 
 
@@ -1227,6 +1678,7 @@ def _generate_starts(
     so near-zero transformed parameters still receive meaningful perturbations.
     All generated points are clipped to ``[lower, upper]`` when provided.
     """
+
     def _clip(x):
         if lower is not None:
             x = np.maximum(x, lower)
@@ -1256,9 +1708,18 @@ def estimate_lifecycle_params(
     transform: bool = True,
     savings_rate: float | None = None,
 ) -> LifecycleCalibrationResult:
-    """Estimate beta_annual, chi_b, and chi_n jointly by SMM using DFO-LS."""
-    import dfols
+    """Estimate beta_annual, chi_b, and chi_n jointly by SMM using DFO-LS.
 
+    Every residual evaluation solves the full general-equilibrium steady
+    state, so this is expensive.  It is intended for inference from an
+    already calibrated starting point rather than as the primary calibration
+    routine.
+    """
+    if dfols is None:
+        raise ImportError(
+            "dfo-ls is required for estimate_lifecycle_params; install it "
+            "with `uv add dfo-ls`."
+        )
     if config is None:
         config = LifecycleCalibrationConfig()
     config.validate(p)
@@ -1311,20 +1772,19 @@ def estimate_lifecycle_params(
                 ss_cache=_cache,
             )
 
-        maxfun = config.dfols_maxfun
         dfols_result = dfols.solve(
             residual_fn,
             theta_start,
             bounds=(lower, upper),
             rhoend=config.dfols_rhoend,
-            maxfun=maxfun,
+            maxfun=config.dfols_maxfun,
             do_logging=config.log_optimizer_progress,
             print_progress=False,
         )
         all_start_results.append(dfols_result)
         obj = float(dfols_result.obj)
         logger.info(
-            "Lifecycle SMM: start %d/%d finished — objective=%.6e, "
+            "Lifecycle SMM: start %d/%d finished, objective=%.6e, "
             "evals=%d, msg=%s",
             i + 1,
             config.n_starts,
@@ -1385,21 +1845,9 @@ def compute_parameter_vcv(
         base_chi_n = _ss_chi_n(p)
     ss_cache = SSSolutionCache(use_ss_solver=config.use_ss_solver_restart)
     theta_hat = _as_vector(theta_hat)
-    params = unpack_lifecycle_params(
-        theta_hat,
-        p,
-        config,
-        base_chi_n=base_chi_n,
-        transform=transform,
+    base_moments = _evaluate_model_moments(
+        theta_hat, p, config, base_chi_n, client, transform, ss_cache
     )
-    apply_lifecycle_params(
-        p,
-        params["beta_annual"],
-        params["chi_b"],
-        params["chi_n"],
-    )
-    ss_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
-    base_moments = compute_model_moments(ss_output, p, config)
     deriv = np.zeros((base_moments.values.size, theta_hat.size))
 
     for i in range(theta_hat.size):
@@ -1408,38 +1856,12 @@ def compute_parameter_vcv(
         low = theta_hat.copy()
         high[i] += step
         low[i] -= step
-
-        high_params = unpack_lifecycle_params(
-            high,
-            p,
-            config,
-            base_chi_n=base_chi_n,
-            transform=transform,
+        high_moments = _evaluate_model_moments(
+            high, p, config, base_chi_n, client, transform, ss_cache
         )
-        apply_lifecycle_params(
-            p,
-            high_params["beta_annual"],
-            high_params["chi_b"],
-            high_params["chi_n"],
+        low_moments = _evaluate_model_moments(
+            low, p, config, base_chi_n, client, transform, ss_cache
         )
-        high_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
-        high_moments = compute_model_moments(high_output, p, config)
-
-        low_params = unpack_lifecycle_params(
-            low,
-            p,
-            config,
-            base_chi_n=base_chi_n,
-            transform=transform,
-        )
-        apply_lifecycle_params(
-            p,
-            low_params["beta_annual"],
-            low_params["chi_b"],
-            low_params["chi_n"],
-        )
-        low_output = solve_ss_with_cache(p, client=client, ss_cache=ss_cache)
-        low_moments = compute_model_moments(low_output, p, config)
         deriv[:, i] = (high_moments.values - low_moments.values) / (2 * step)
 
     return np.linalg.pinv(deriv.T @ W @ deriv)

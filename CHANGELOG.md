@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [Unreleased]
+
+### Changed
+
+- `ogusa/estimate_lifecycle_params.py` now builds the default preference-calibration moment set as hours by single year of age (CPS, lightly smoothed), one SCF wealth share per lifetime-income type with percentile bins taken from `p.lambdas`, and the ratio of mean SCF net worth at ages 75-79 to ages 60-64. The normalized wealth-by-age profile, income Gini, gross saving rate, wealth Gini, variance of log wealth, and aggregate bequests over GDP are optional or diagnostic moments. See `LIFECYCLE_CALIBRATION_PLAN.md`.
+- Age aggregation of model moments uses the (S, J) steady-state population distribution from OG-Core rather than `lambdas` alone.
+- `SS.SS_solver` warm starts are called by keyword against the installed OG-Core signature, and a failed warm start logs a warning before falling back to a cold solve.
+- Moved `tool.uv.dev-dependencies` into `[dependency-groups] dev` in `pyproject.toml`.
+
+### Fixed
+
+- `wealth.compute_wealth_moments` no longer drops the wealthiest observation from the top percentile bin, so shares sum to one.
+- Wealth-by-age model moments map age `a` to `b_sp1[a - starting_age - 1]`, the savings actually held at age `a`.
+- DFO-LS bounds in `estimate_lifecycle_params` are built in the transformed (logit/log) parameter space from the ParamTools validators intersected with configurable bounds; the previous code raised on scalar concatenation.
+- Solver failures inside the SMM residual and objective return a bounded penalty instead of `1e15`.
+
+### Removed
+
+- `ogusa/calibrate_chi_n.py`, which targeted an OG-Core API that no longer exists.
+
 ## [0.5.0] - 2026-07-25 12:00:00
 
 ### Fixed
