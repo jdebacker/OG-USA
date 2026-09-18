@@ -252,12 +252,77 @@ much saving the calibrated parameters deliver.
 
 ### Phase 5. Outer general-equilibrium loop
 
-Solve the full steady state, run Phases 3 and 4, re-solve warm-started from
-the previous solution, repeat until prices, bequests, transfers, and the
-scaling factor stop moving. Requires one OG-Core change: let `run_SS`
-accept initial guesses for the baseline case. Open that as a separate
-OG-Core pull request early. Expect five to fifteen steady-state solves in
-total (unmeasured; report actual timings from the first run).
+Status: done 2026-09-18 (`calibrate_lifecycle_preferences`,
+`solve_ge_steady_state` in `ogusa/calibrate_lifecycle.py`). The warm start
+is implemented on the OG-USA side by calling OG-Core's `SS.SS_fsolve` root
+finder from the previous solution and assembling output with
+`SS.SS_solver(fsolve_flag=True)`, handling solver layouts with and without
+`G`; no OG-Core change was needed. Parameter updates are blended in
+transformed space with adaptive damping (halved whenever the parameter
+change fails to shrink by ten percent).
+
+Run with the default options (SCF pre-transfer income, bequest flow as a
+target, by-type chi_b, bottom bin excluded), starting from the
+default-parameter steady state:
+
+| Pass | Max param change | Max price change | Pref solves | GE solve |
+|---|---|---|---|---|
+| 1 | 5.89 | 0.64 (BQ) | 1,062 | 151 s (warm start failed, cold fallback) |
+| 2 | 1.19 | 0.15 (factor) | 222 | 15 s |
+| 3 | 0.22 | 0.045 | 327 | 21 s |
+| 4 | 0.057 | 0.021 | 141 | 18 s |
+| 5 | 0.004 | 0.0005 | 30 | 18 s |
+| 6 to 8 | 0.048, 0.017, 3e-11 | below 0.003 | 42 to 74 | 10 to 15 s |
+
+Total 22 minutes, converged at pass 8 (damping fell to 0.5 at pass 6).
+Final general equilibrium: interest rate 4.8 percent (portfolio return
+3.55 percent), wage 1.394, scaling factor 302k. Hours match CPS at every
+age to a 0.001 log gap. Wealth shares: the 80-90, 90-99, and top three
+bins are within 6 percent; 50-70 is +13 percent, 70-80 is -14 percent, and
+99-99.5 is -51 percent (the type 7 ability issue). Wealth over income is
+5.4 against the pre-transfer target of 8.4; the bequest-flow ratio is
+0.030 against 0.017. Betas: 0.953 (types 1-3), 0.969, 0.923, then 0.9999
+for types 6-9 and 0.996 for type 10. chi_b: 9.3 (types 1-3), 25.9, 20.7,
+30.4, 77.2 (top). chi_n: 520 at 20, 71 to 76 over 30-45, 156 at 60, 390
+at 65, 1,556 at 70, 5,296 at 75, 7,124 at 79 (the 10,000 cap is close).
+
+Pass 1's warm start failed because the first parameter jump is large;
+later passes warm-start in 10 to 20 seconds against 150 seconds cold.
+
+Second run with SCF total income as the level target and the bequest-flow
+weight set to zero (diagnostic only): 12 passes, 34 minutes, prices settled
+to relative changes below 0.0005 from pass 9 but the transformed parameter
+change hovered at 0.01 to 0.015, which is the beta versus chi_b ridge
+wandering with no effect on the moments (fixed-price cost flat at 0.2365
+from pass 4). The default parameter tolerance was loosened to 0.01
+afterwards. Final fit: hours to 0.001 log gap; wealth shares within 6
+percent for the 80-90, 90-99, and top three bins, +11 percent for 50-70,
+-15 percent for 70-80, -47 percent for 99-99.5; tilt bins 50-70, 70-80,
+and 80-90 within 1 percent, 90-99 +29 percent, top +17 percent; wealth over
+income 5.1 against 7.0; bequest flow 0.030 against 0.017. Betas 0.948
+(types 1-3), 0.930, 0.950, 0.9999 for types 6-8, 0.998, 0.995; chi_b 9.2
+(types 1-3), 34.9, 13.3, 29.2, 66.0 (top); chi_n 7,412 at age 79.
+
+What the two runs say together:
+
+- The loop works: eight to twelve passes, 20 to 35 minutes, hours exact,
+  and the type-specific tilt moments for the middle of the distribution
+  are matched almost exactly once general-equilibrium prices are
+  consistent.
+- The wealth level cannot be reached under either income concept even
+  with types 6 to 8 at the 0.9999 beta ceiling, because the middle types'
+  betas are held down by their share targets. Wealth concentration in the
+  SCF exceeds what the model's ability profiles can generate through
+  patience alone at a 3.7 percent portfolio return; matching it would need
+  return heterogeneity, a larger ability gap between types 7 and 8, or a
+  bequest motive that is stronger at the top than the by-type tilt
+  supports.
+- The rich do not decumulate in the model (tilt for the 90-99 bin 1.0
+  against 0.76 in the SCF), which is the same structural gap the aggregate
+  bequest flow shows.
+- chi_n at ages 75 to 79 is 5,300 to 7,400 and rises as the portfolio
+  return falls; the 10,000 validator cap is within reach of any further
+  drop in returns.
 
 ### Phase 6. Integrate and validate
 
