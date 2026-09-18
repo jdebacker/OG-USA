@@ -658,3 +658,221 @@ def test_calibrate_beta_chi_b_requires_needed_moments():
         cl.calibrate_beta_chi_b(
             {"b_sp1": np.ones((80, 10)), "n": np.ones((80, 10))}, p, moments
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: outer general-equilibrium loop
+# ---------------------------------------------------------------------------
+
+
+class MockGEParams(MockPrefParams):
+    """
+    Parameter object with the fields the warm-started GE solve reads.
+    """
+
+    baseline = True
+    baseline_spending = False
+    budget_balance = False
+    use_zeta = False
+    M = 1
+    alpha_T = np.array([0.1])
+    SS_root_method = "hybr"
+    mindist_SS = 1e-9
+
+
+def _ge_output(p, r_p=0.04, scale=1.0):
+    return {
+        "r_p": r_p,
+        "r": r_p + 0.01,
+        "w": 1.3,
+        "p_m": np.array([1.0]),
+        "Y": 2.0,
+        "BQ": np.linspace(0.01, 0.1, p.J),
+        "G": 0.3,
+        "TR": 0.2,
+        "factor": 1e5 * scale,
+        "b_sp1": np.ones((p.S, p.J)) * scale,
+        "n": np.ones((p.S, p.J)) * 0.3,
+        "before_tax_income": np.ones((p.S, p.J)),
+    }
+
+
+def test_ss_guesses_layout_follows_installed_solver(monkeypatch):
+    """
+    Guess vector: r_p, r, w, p_m, Y, BQ items, [G], TR, factor.
+    """
+    p = MockGEParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    prev = _ge_output(p)
+    monkeypatch.setattr(cl, "_ss_solver_has_G", lambda: False)
+    guesses = cl._ss_guesses_from_solution(prev, p)
+    assert guesses[:3] == [0.04, 0.05, 1.3]
+    assert guesses[3] == 1.0
+    assert guesses[4] == 2.0
+    assert len(guesses) == 3 + 1 + 1 + p.J + 2
+    assert guesses[-2:] == [0.2, 1e5]
+    vals = cl._unpack_ss_solution(np.array(guesses), p)
+    assert vals["r_p"] == 0.04 and vals["factor"] == 1e5 and vals["TR"] == 0.2
+    assert np.allclose(vals["BQ"], prev["BQ"])
+    assert np.isclose(vals["Y"], 0.2 / 0.1)
+
+    monkeypatch.setattr(cl, "_ss_solver_has_G", lambda: True)
+    guesses_g = cl._ss_guesses_from_solution(prev, p)
+    assert len(guesses_g) == len(guesses) + 1
+    assert guesses_g[-3:] == [0.3, 0.2, 1e5]
+    vals_g = cl._unpack_ss_solution(np.array(guesses_g), p)
+    assert vals_g["G"] == 0.3
+    assert np.allclose(vals_g["BQ"], prev["BQ"])
+
+
+def test_solve_ge_steady_state_warm_starts_and_falls_back(monkeypatch):
+    """
+    A converged warm start assembles output through SS_solver; a failed
+    one falls back to run_SS.
+    """
+    from types import SimpleNamespace
+
+    p = MockGEParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    prev = _ge_output(p)
+    calls = []
+    monkeypatch.setattr(cl, "_ss_solver_has_G", lambda: False)
+
+    def fake_root(fun, x0, args=None, method=None, tol=None):
+        calls.append(("root", list(x0)))
+        assert fun is cl.SS.SS_fsolve
+        assert len(args) == 7
+        return SimpleNamespace(
+            success=True, x=np.asarray(x0) * 1.1, message="ok"
+        )
+
+    def fake_ss_solver(**kwargs):
+        calls.append(("solver", kwargs["fsolve_flag"], kwargs["factor"]))
+        return _ge_output(p, scale=2.0)
+
+    import scipy.optimize
+
+    monkeypatch.setattr(scipy.optimize, "root", fake_root)
+    monkeypatch.setattr(cl.SS, "SS_solver", fake_ss_solver)
+    monkeypatch.setattr(
+        cl.SS, "run_SS", lambda p, client=None: pytest.fail("cold solve")
+    )
+    out = cl.solve_ge_steady_state(p, previous=prev)
+    assert out["factor"] == 2e5
+    assert calls[0][0] == "root"
+    assert calls[1] == ("solver", True, pytest.approx(1.1e5))
+
+    def failing_root(fun, x0, args=None, method=None, tol=None):
+        return SimpleNamespace(success=False, x=np.asarray(x0), message="no")
+
+    monkeypatch.setattr(scipy.optimize, "root", failing_root)
+    monkeypatch.setattr(
+        cl.SS, "run_SS", lambda p, client=None: _ge_output(p, scale=3.0)
+    )
+    out = cl.solve_ge_steady_state(p, previous=prev)
+    assert out["factor"] == 3e5
+    # No previous solution: straight to run_SS.
+    assert cl.solve_ge_steady_state(p)["factor"] == 3e5
+
+
+def test_calibrate_lifecycle_preferences_converges_with_fakes(monkeypatch):
+    """
+    The outer loop alternates the inner steps and stops when parameters and
+    prices settle; damping halves when the parameter change grows.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    p = MockGEParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    config = elp.LifecycleCalibrationConfig(
+        include_wealth_distribution=False,
+        include_wealth_income_ratio=False,
+        include_bequest_flow_ratio=False,
+        include_old_age_ratio_by_type=False,
+    )
+    ages = config.moment_ages
+    data = elp.MomentSet(
+        tuple(f"labor_supply_age_{a}" for a in ages), np.full(ages.size, 0.3)
+    )
+    state = {"r_p": 0.04}
+
+    def fake_invert(ss, params, target, config=None, client=None):
+        chi_n = np.full(params.S, 30.0 * (1 + 10 * state["r_p"]))
+        params.update_specifications({"chi_n": chi_n.tolist()})
+        return cl.ChiNInversionResult(
+            chi_n=chi_n,
+            ages=ages,
+            labor_model=target,
+            labor_target=target,
+            iterations=3,
+            converged=True,
+            max_abs_log_gap=1e-4,
+            history=[],
+            capped_ages=np.array([]),
+            ss_output=ss,
+            solution=None,
+        )
+
+    def fake_pref(
+        ss, params, data_moments, config=None, options=None, client=None
+    ):
+        # beta responds to the current interest rate; chi_b fixed.
+        beta = np.clip(0.9 + 2.0 * state["r_p"], 0.5, 0.999) * np.ones(
+            params.J
+        )
+        params.update_specifications({"beta_annual": beta.tolist()})
+        return cl.PreferenceCalibrationResult(
+            beta_annual=beta,
+            chi_b=params.chi_b,
+            theta=np.zeros(1),
+            residuals=np.zeros(1),
+            residual_names=("x",),
+            data_values=np.ones(1),
+            model_values=np.ones(1),
+            cost=1e-6,
+            nfev=5,
+            success=True,
+            message="ok",
+            ss_output=ss,
+            solution=None,
+        )
+
+    def fake_ge(params, previous=None, client=None):
+        # Interest rate falls toward 0.03 as beta rises: a contraction.
+        state["r_p"] = 0.03 + 0.5 * (0.97 - params.beta_annual.mean())
+        return _ge_output(params, r_p=state["r_p"])
+
+    def fake_model_moments(ss, params, config):
+        return data
+
+    monkeypatch.setattr(cl, "invert_chi_n", fake_invert)
+    monkeypatch.setattr(cl, "calibrate_beta_chi_b", fake_pref)
+    monkeypatch.setattr(cl, "solve_ge_steady_state", fake_ge)
+    monkeypatch.setattr(elp, "compute_model_moments", fake_model_moments)
+
+    outcome = cl.calibrate_lifecycle_preferences(
+        p,
+        config=config,
+        data_moments=data,
+        max_outer=30,
+        param_tol=1e-6,
+        price_tol=1e-6,
+    )
+    assert outcome.converged
+    assert 2 < outcome.iterations < 30
+    assert np.allclose(outcome.beta_annual, 0.9 + 2.0 * state["r_p"])
+    assert outcome.chi_n.shape == (p.S,)
+    assert outcome.history[-1].param_change < 1e-6
+    assert set(outcome.parameter_dict) == {"beta_annual", "chi_b", "chi_n"}
+    assert list(outcome.to_frame().columns) == ["moment", "data", "model"]
+
+    # Non-convergence within the cap is reported, not raised.
+    p2 = MockGEParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    state["r_p"] = 0.04
+    short = cl.calibrate_lifecycle_preferences(
+        p2,
+        config=config,
+        data_moments=data,
+        max_outer=1,
+        param_tol=1e-12,
+        price_tol=1e-12,
+    )
+    assert not short.converged
+    assert short.iterations == 1

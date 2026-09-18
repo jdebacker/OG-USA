@@ -883,3 +883,395 @@ def calibrate_beta_chi_b(
         ss_output=updated,
         solution=solution,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: outer general-equilibrium loop
+# ---------------------------------------------------------------------------
+
+
+def _ss_solver_has_G() -> bool:
+    """Whether the installed OG-Core steady-state solver carries G."""
+    import inspect
+
+    return "G" in inspect.signature(SS.SS_solver).parameters
+
+
+def _ss_guesses_from_solution(previous: dict, p) -> list:
+    """Outer-loop guess vector for ``SS.SS_fsolve`` from a prior solution.
+
+    Layout follows ``SS.run_SS`` for a baseline solve: ``[r_p, r, w]``,
+    then ``p_m``, ``Y``, the bequest items, ``G`` on OG-Core versions whose
+    solver carries it, ``TR``, and ``factor``.
+    """
+    BQ = np.atleast_1d(np.asarray(previous["BQ"], dtype=float))
+    bq_items = [float(BQ.sum())] if p.use_zeta else BQ.tolist()
+    guesses = (
+        [float(previous["r_p"]), float(previous["r"]), float(previous["w"])]
+        + np.atleast_1d(np.asarray(previous["p_m"], dtype=float)).tolist()
+        + [float(previous["Y"])]
+        + bq_items
+    )
+    if _ss_solver_has_G():
+        guesses.append(float(previous["G"]))
+    guesses.append(float(previous["TR"]))
+    guesses.append(float(previous["factor"]))
+    return guesses
+
+
+def _unpack_ss_solution(x: np.ndarray, p) -> dict:
+    """Split the root-finder solution into named outer-loop variables."""
+    x = np.asarray(x, dtype=float)
+    has_G = _ss_solver_has_G()
+    out = {
+        "r_p": float(x[0]),
+        "r": float(x[1]),
+        "w": float(x[2]),
+        "p_m": x[3 : 3 + p.M],
+        "Y": float(x[3 + p.M]),
+    }
+    tail = 3 if has_G else 2
+    out["BQ"] = x[3 + p.M + 1 : -tail]
+    if has_G:
+        out["G"] = float(x[-3])
+    out["TR"] = float(x[-2])
+    out["factor"] = float(x[-1])
+    if not p.budget_balance and not p.baseline_spending:
+        out["Y"] = out["TR"] / p.alpha_T[-1]
+    return out
+
+
+def solve_ge_steady_state(
+    p, previous: dict | None = None, client=None
+) -> dict:
+    """Solve the baseline general-equilibrium steady state.
+
+    With ``previous`` (an earlier OG-Core steady-state output), the outer
+    root finder starts from that solution's prices, aggregates, and
+    household arrays instead of OG-Core's cold guesses, which matters when
+    the calibrated parameters move the equilibrium far from the defaults.
+    If the warm start fails to converge the solve falls back to
+    ``SS.run_SS``.  Serial solves (``client=None``) are much faster than
+    Dask on a single machine because the steady state is dominated by
+    parameter-scattering overhead.
+    """
+    from scipy import optimize
+
+    if not p.baseline:
+        raise ValueError("solve_ge_steady_state supports baseline solves.")
+    if previous is None or p.baseline_spending:
+        return SS.run_SS(p, client=client)
+
+    guesses = _ss_guesses_from_solution(previous, p)
+    b_guess = np.asarray(previous["b_sp1"], dtype=float)
+    n_guess = np.asarray(previous["n"], dtype=float)
+    args = [b_guess, n_guess, None, None, None, p, client]
+    if _ss_solver_has_G():
+        args.append(None)  # scattered_p
+    try:
+        sol = optimize.root(
+            SS.SS_fsolve,
+            guesses,
+            args=tuple(args),
+            method=p.SS_root_method,
+            tol=p.mindist_SS,
+        )
+    except _WARM_START_ERRORS as err:
+        logger.warning(
+            "Warm-started GE solve raised %s: %s; using SS.run_SS.",
+            type(err).__name__,
+            err,
+        )
+        return SS.run_SS(p, client=client)
+    if not sol.success:
+        logger.warning(
+            "Warm-started GE solve did not converge (%s); using SS.run_SS.",
+            sol.message,
+        )
+        return SS.run_SS(p, client=client)
+
+    vals = _unpack_ss_solution(sol.x, p)
+    kwargs = {
+        "bmat": b_guess,
+        "nmat": n_guess,
+        "r_p": vals["r_p"],
+        "r": vals["r"],
+        "w": vals["w"],
+        "p_m": vals["p_m"],
+        "Y": vals["Y"],
+        "BQ": vals["BQ"],
+        "TR": vals["TR"],
+        "Ig_baseline": None,
+        "factor": vals["factor"],
+        "p": p,
+        "client": client,
+        "fsolve_flag": True,
+    }
+    if "G" in vals:
+        kwargs["G"] = vals["G"]
+    return SS.SS_solver(**kwargs)
+
+
+_WARM_START_ERRORS = (
+    AssertionError,
+    FloatingPointError,
+    KeyError,
+    RuntimeError,
+    TypeError,
+    ValueError,
+)
+
+
+@dataclass
+class OuterIterationRecord:
+    """Diagnostics for one pass of the outer calibration loop."""
+
+    iteration: int
+    param_change: float
+    price_change: float
+    damping: float
+    chi_n_iterations: int
+    pref_nfev: int
+    pref_cost: float
+    ge_seconds: float
+    prices: dict
+    residuals: dict
+
+
+@dataclass
+class LifecycleCalibrationOutcome:
+    """Result of the full nested preference calibration."""
+
+    beta_annual: np.ndarray
+    chi_b: np.ndarray
+    chi_n: np.ndarray
+    ss_output: dict
+    iterations: int
+    converged: bool
+    history: list
+    data_moments: object
+    model_moments: object
+    chi_n_result: ChiNInversionResult | None
+    pref_result: PreferenceCalibrationResult | None
+
+    @property
+    def parameter_dict(self) -> dict:
+        """Calibrated values in ``update_specifications`` format."""
+        return {
+            "beta_annual": np.asarray(self.beta_annual).tolist(),
+            "chi_b": np.asarray(self.chi_b).tolist(),
+            "chi_n": np.asarray(self.chi_n).tolist(),
+        }
+
+    def to_frame(self):
+        """Data versus model moments at the final general equilibrium."""
+        return self.data_moments.to_frame(self.model_moments)
+
+
+def _theta_from_p(p) -> np.ndarray:
+    """Stack transformed preference parameters for change tracking."""
+    from ogusa import estimate_lifecycle_params as elp
+
+    beta = np.asarray(p.beta_annual, dtype=float)
+    return np.concatenate(
+        [
+            _logit(beta),
+            np.log(np.asarray(p.chi_b, dtype=float)),
+            np.log(elp._ss_chi_n(p)),
+        ]
+    )
+
+
+def _apply_theta(theta: np.ndarray, p) -> None:
+    """Inverse of :func:`_theta_from_p`, applied to the spec."""
+    J = p.J
+    beta = _logistic(theta[:J])
+    chi_b = np.exp(theta[J : 2 * J])
+    chi_n = np.exp(theta[2 * J :])
+    p.update_specifications(
+        {
+            "beta_annual": beta.tolist(),
+            "chi_b": chi_b.tolist(),
+            "chi_n": chi_n.tolist(),
+        }
+    )
+
+
+def _price_change(new: dict, old: dict) -> tuple[float, dict]:
+    """Largest relative change across the outer-loop prices."""
+    keys = ("r_p", "r", "w", "factor", "TR")
+    changes = {}
+    for key in keys:
+        a, b = float(np.squeeze(old[key])), float(np.squeeze(new[key]))
+        changes[key] = abs(b - a) / max(abs(a), 1e-12)
+    bq_old = np.asarray(old["BQ"], dtype=float).sum()
+    bq_new = np.asarray(new["BQ"], dtype=float).sum()
+    changes["BQ"] = abs(bq_new - bq_old) / max(abs(bq_old), 1e-12)
+    return max(changes.values()), changes
+
+
+def calibrate_lifecycle_preferences(
+    p,
+    config=None,
+    options: PreferenceCalibrationOptions | None = None,
+    data_moments=None,
+    initial_ss: dict | None = None,
+    max_outer: int = 15,
+    param_tol: float = 1e-3,
+    price_tol: float = 1e-3,
+    outer_damping: float = 1.0,
+    adaptive_damping: bool = True,
+    reinvert_chi_n: bool = True,
+    client=None,
+    ge_client=None,
+) -> LifecycleCalibrationOutcome:
+    """Calibrate chi_n, beta by type, and chi_b to joint GE convergence.
+
+    Each outer pass: solve (or reuse) the general-equilibrium steady state,
+    invert the labor FOC for ``chi_n`` at those prices, calibrate ``beta``
+    and ``chi_b`` at those prices, optionally re-invert ``chi_n`` so hours
+    stay on target after the preference change, blend the new parameters
+    with the old ones by ``outer_damping`` in transformed space, and
+    re-solve the general equilibrium warm-started from the previous
+    solution.  Stops when the largest transformed-parameter change and the
+    largest relative price change both fall below their tolerances.
+
+    With ``adaptive_damping`` the damping factor halves whenever the
+    parameter change fails to shrink by at least ten percent from one pass
+    to the next, which guards against
+    the oscillation that strong general-equilibrium feedback (saving down,
+    interest rate up, hours up) can produce.
+
+    On return ``p`` carries the calibrated parameters and the outcome holds
+    the final steady state and a data-versus-model moment table.
+    """
+    import time
+
+    from ogusa import estimate_lifecycle_params as elp
+
+    if config is None:
+        config = elp.LifecycleCalibrationConfig()
+    if options is None:
+        options = PreferenceCalibrationOptions()
+    config.validate(p)
+    if data_moments is None:
+        data_moments = elp.compute_data_moments(p, config)
+    labor_target = np.array(
+        [
+            dict(zip(data_moments.names, data_moments.values))[
+                f"labor_supply_age_{age}"
+            ]
+            for age in config.moment_ages
+        ]
+    )
+
+    t = time.time()
+    ss = (
+        initial_ss
+        if initial_ss is not None
+        else solve_ge_steady_state(p, client=ge_client)
+    )
+    logger.info("Outer loop: initial GE solve took %.0f s", time.time() - t)
+
+    history: list[OuterIterationRecord] = []
+    damping = float(outer_damping)
+    converged = False
+    chi_n_result = None
+    pref_result = None
+    previous_change = np.inf
+    for iteration in range(1, max_outer + 1):
+        theta_old = _theta_from_p(p)
+        chi_n_result = invert_chi_n(
+            ss, p, labor_target, config=config, client=client
+        )
+        pref_result = calibrate_beta_chi_b(
+            chi_n_result.ss_output,
+            p,
+            data_moments,
+            config=config,
+            options=options,
+            client=client,
+        )
+        if reinvert_chi_n:
+            chi_n_result = invert_chi_n(
+                pref_result.ss_output,
+                p,
+                labor_target,
+                config=config,
+                client=client,
+            )
+        theta_new = _theta_from_p(p)
+        param_change = float(np.max(np.abs(theta_new - theta_old)))
+        if adaptive_damping and param_change > 0.9 * previous_change:
+            # Not shrinking fast enough (or growing): damp harder.
+            damping = max(damping / 2.0, 0.05)
+            logger.info("Outer loop: damping reduced to %.3f", damping)
+        previous_change = param_change
+        if damping < 1.0:
+            _apply_theta(theta_old + damping * (theta_new - theta_old), p)
+
+        t = time.time()
+        ss_new = solve_ge_steady_state(p, previous=ss, client=ge_client)
+        ge_seconds = time.time() - t
+        price_change, changes = _price_change(ss_new, ss)
+        model_moments = elp.compute_model_moments(ss_new, p, config)
+        residuals = dict(
+            zip(
+                data_moments.names,
+                elp.moment_residuals(model_moments, data_moments, "relative"),
+            )
+        )
+        history.append(
+            OuterIterationRecord(
+                iteration=iteration,
+                param_change=param_change,
+                price_change=price_change,
+                damping=damping,
+                chi_n_iterations=chi_n_result.iterations,
+                pref_nfev=pref_result.nfev,
+                pref_cost=pref_result.cost,
+                ge_seconds=ge_seconds,
+                prices={
+                    k: float(np.squeeze(ss_new[k]))
+                    for k in ("r_p", "r", "w", "factor", "TR")
+                },
+                residuals=residuals,
+            )
+        )
+        logger.info(
+            "Outer loop %d: max param change %.3e, max price change %.3e "
+            "(%s), GE %.0f s, pref cost %.3e",
+            iteration,
+            param_change,
+            price_change,
+            max(changes, key=changes.get),
+            ge_seconds,
+            pref_result.cost,
+        )
+        ss = ss_new
+        if param_change < param_tol and price_change < price_tol:
+            converged = True
+            break
+
+    if not converged:
+        logger.warning(
+            "Outer loop did not converge in %d passes (param change %.3e, "
+            "price change %.3e).",
+            max_outer,
+            history[-1].param_change,
+            history[-1].price_change,
+        )
+    model_moments = elp.compute_model_moments(ss, p, config)
+    return LifecycleCalibrationOutcome(
+        beta_annual=np.asarray(p.beta_annual, dtype=float).copy(),
+        chi_b=np.asarray(p.chi_b, dtype=float).copy(),
+        chi_n=elp._ss_chi_n(p),
+        ss_output=ss,
+        iterations=len(history),
+        converged=converged,
+        history=history,
+        data_moments=data_moments,
+        model_moments=model_moments,
+        chi_n_result=chi_n_result,
+        pref_result=pref_result,
+    )
