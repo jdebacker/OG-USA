@@ -89,10 +89,22 @@ class LifecycleCalibrationConfig:
     include_wealth_distribution: bool = True
     include_wealth_gini: bool = False
     include_wealth_var_log: bool = False
-    # Old-age wealth ratio (chi_b target)
-    include_old_age_wealth_ratio: bool = True
+    # Wealth level: mean net worth over mean pre-transfer income (beta scale)
+    include_wealth_income_ratio: bool = True
+    scf_income_concept: Literal["pre_transfer", "total"] = "pre_transfer"
+    # Bequest flow: wealth of decedents over wealth of the living, using the
+    # model's mortality rates on both sides (chi_b target)
+    include_bequest_flow_ratio: bool = True
+    # Old-age wealth ratio, aggregate (diagnostic; barely responds to chi_b)
+    include_old_age_wealth_ratio: bool = False
     old_age_ratio_numerator_ages: tuple[int, int] = (75, 79)
     old_age_ratio_denominator_ages: tuple[int, int] = (60, 64)
+    # Old-age wealth ratio by wealth-percentile bin within age bands
+    # (type-specific chi_b targets; off by default)
+    include_old_age_ratio_by_type: bool = True
+    tilt_numerator_ages: tuple[int, int] = (80, 89)
+    tilt_denominator_ages: tuple[int, int] = (60, 64)
+    tilt_bin_weights: tuple[float, ...] | None = None
     # Optional aggregate and inequality moments
     include_bequest_to_output: bool = False
     bequest_to_output_data: float | None = None
@@ -163,6 +175,31 @@ class LifecycleCalibrationConfig:
         return np.arange(lo, hi + 1)
 
     @property
+    def tilt_numerator_age_labels(self) -> np.ndarray:
+        """Return age labels in the by-type tilt numerator band."""
+        lo, hi = self.tilt_numerator_ages
+        return np.arange(lo, hi + 1)
+
+    @property
+    def tilt_denominator_age_labels(self) -> np.ndarray:
+        """Return age labels in the by-type tilt denominator band."""
+        lo, hi = self.tilt_denominator_ages
+        return np.arange(lo, hi + 1)
+
+    def tilt_bins(self, p) -> np.ndarray:
+        """Population bin weights for the by-type tilt moments.
+
+        Defaults to ``p.lambdas`` with the bottom half of the population
+        merged into one bin (its mean wealth is near zero, so ratios of it
+        are noise) and every type inside the top one percent merged into
+        another, since SCF cells at old ages are too thin to split the top
+        one percent.
+        """
+        if self.tilt_bin_weights is not None:
+            return _as_vector(self.tilt_bin_weights)
+        return merged_type_bins(_lambdas(p))
+
+    @property
     def estimated_chi_n_ages(self) -> np.ndarray:
         """Return the age labels for directly estimated chi_n values."""
         return np.arange(
@@ -195,6 +232,8 @@ class LifecycleCalibrationConfig:
             ),
             ("old-age numerator", *self.old_age_ratio_numerator_ages),
             ("old-age denominator", *self.old_age_ratio_denominator_ages),
+            ("tilt numerator", *self.tilt_numerator_ages),
+            ("tilt denominator", *self.tilt_denominator_ages),
         ):
             if hi < lo:
                 raise ValueError(f"{label} max age must be at least min age.")
@@ -212,6 +251,9 @@ class LifecycleCalibrationConfig:
         if self.include_old_age_wealth_ratio:
             wealth_age_sets.append(self.old_age_numerator_ages)
             wealth_age_sets.append(self.old_age_denominator_ages)
+        if self.include_old_age_ratio_by_type:
+            wealth_age_sets.append(self.tilt_numerator_age_labels)
+            wealth_age_sets.append(self.tilt_denominator_age_labels)
         if wealth_age_sets:
             wealth_ages = np.concatenate(wealth_age_sets)
             if wealth_ages.min() <= min_model_age:
@@ -524,6 +566,47 @@ def _normalize_wealth_profile(
 # ---------------------------------------------------------------------------
 
 
+def merged_type_groups(
+    lambdas,
+    bottom_share: float = 0.5,
+    top_share: float = 0.01,
+) -> list[list[int]]:
+    """Group type indices: bottom ``bottom_share`` merged, top merged.
+
+    Types whose cumulative population share lies within ``bottom_share`` of
+    the bottom form one group, types inside the top ``top_share`` form one
+    group, and every other type is its own group.  For the default OG-USA
+    lambdas this gives ``[[0, 1], [2], [3], [4], [5], [6, 7, 8, 9]]``.
+    """
+    lambdas = _as_vector(lambdas)
+    cum = np.cumsum(lambdas)
+    start = np.concatenate([[0.0], cum[:-1]])
+    groups: list[list[int]] = []
+    bottom = [j for j in range(lambdas.size) if cum[j] <= bottom_share + 1e-12]
+    top = [
+        j for j in range(lambdas.size) if start[j] >= 1.0 - top_share - 1e-12
+    ]
+    if bottom:
+        groups.append(bottom)
+    for j in range(lambdas.size):
+        if j not in bottom and j not in top:
+            groups.append([j])
+    if top:
+        groups.append(top)
+    return groups
+
+
+def merged_type_bins(lambdas, **kwargs) -> np.ndarray:
+    """Population bin weights for :func:`merged_type_groups`."""
+    lambdas = _as_vector(lambdas)
+    return np.array(
+        [
+            lambdas[group].sum()
+            for group in merged_type_groups(lambdas, **kwargs)
+        ]
+    )
+
+
 def _percent_label(share: float) -> str:
     """Format a cumulative population share as a percentile label."""
     pct = 100.0 * share
@@ -679,13 +762,205 @@ def load_cps_hours_data(
 
 
 def load_scf_wealth_data(config: LifecycleCalibrationConfig) -> pd.DataFrame:
-    """Load SCF wealth data with ages for wealth moments."""
+    """Load SCF wealth data with ages (and income) for wealth moments."""
     return wealth.get_wealth_data(
         scf_yrs_list=list(config.scf_yrs_list),
         web=config.scf_web,
         directory=config.scf_directory,
         include_age=True,
+        include_income=config.include_wealth_income_ratio,
     )
+
+
+def _mortality_by_age(p) -> np.ndarray:
+    """Steady-state mortality by model age, averaged over types."""
+    rho = np.asarray(p.rho, dtype=float)
+    if rho.ndim == 3:
+        rho = rho[-1]
+    if rho.ndim == 2:
+        joint = _joint_pop_weights(p)
+        totals = joint.sum(axis=1)
+        totals = np.where(totals > 0, totals, 1.0)
+        return (rho * joint).sum(axis=1) / totals
+    return rho.reshape(-1)
+
+
+def _scf_model_age_frame(
+    scf: pd.DataFrame, p, value_cols: tuple[str, ...]
+) -> pd.DataFrame:
+    """SCF rows at model ages with numeric columns and positive weights."""
+    starting_age = int(getattr(p, "starting_age", 20))
+    max_age = starting_age + p.S - 1
+    cols = ["age", "wgt", *value_cols]
+    data = scf[cols].copy()
+    for col in cols:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    data = data.replace([np.inf, -np.inf], np.nan).dropna()
+    data = data[(data["wgt"] > 0) & (data["age"] >= starting_age)].copy()
+    # The SCF top-codes age; treat anyone above the model's last age as
+    # being at that age.
+    data["age"] = data["age"].clip(upper=max_age).astype(int)
+    return data
+
+
+def scf_income_series(
+    scf: pd.DataFrame, concept: Literal["pre_transfer", "total"]
+) -> pd.Series:
+    """Household income from the SCF under the requested concept.
+
+    ``pre_transfer`` subtracts Social Security, pension, and other transfer
+    income from total income, matching the model's before-tax income of
+    capital plus labor earnings.  ``total`` uses SCF total income.
+    """
+    if "income" not in scf:
+        raise ValueError(
+            "SCF data lack income columns; regenerate the extracts with "
+            "data/download_moment_data.py or load with include_income."
+        )
+    income = pd.to_numeric(scf["income"], errors="coerce")
+    if concept == "total":
+        return income
+    if concept == "pre_transfer":
+        transfers = pd.to_numeric(
+            scf["ssretinc"], errors="coerce"
+        ) + pd.to_numeric(scf["transfothinc"], errors="coerce")
+        return income - transfers
+    raise ValueError(f"Unsupported SCF income concept: {concept}")
+
+
+def wealth_income_ratio_from_scf(
+    scf: pd.DataFrame, p, config: LifecycleCalibrationConfig
+) -> float:
+    """SCF mean net worth over mean income at model ages."""
+    data = scf.copy()
+    data["income_used"] = scf_income_series(data, config.scf_income_concept)
+    data = _scf_model_age_frame(data, p, ("networth_infadj", "income_used"))
+    mean_wealth = _weighted_mean(data["networth_infadj"], data["wgt"])
+    mean_income = _weighted_mean(data["income_used"], data["wgt"])
+    if not np.isfinite(mean_income) or mean_income <= 0:
+        raise ValueError("SCF mean income is not positive.")
+    return float(mean_wealth / mean_income)
+
+
+def model_wealth_income_ratio(ss_output: dict, p) -> float:
+    """Mean wealth held by the living over mean before-tax income.
+
+    Both are population-weighted over ages and types.  The income scaling
+    factor cancels, so this compares directly with the SCF ratio.
+    """
+    b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
+    income = np.asarray(ss_output["before_tax_income"], dtype=float)
+    joint = _joint_pop_weights(p)
+    mean_wealth = (b_sp1[:-1, :] * joint[1:, :]).sum() / joint.sum()
+    mean_income = (income * joint).sum() / joint.sum()
+    if np.isclose(mean_income, 0.0):
+        raise ValueError("Model mean income is zero.")
+    return float(mean_wealth / mean_income)
+
+
+def bequest_flow_ratio_from_scf(scf: pd.DataFrame, p) -> float:
+    """Mortality-weighted SCF wealth over total SCF wealth.
+
+    Applies the model's own mortality rates by age to SCF net worth by age,
+    so the data moment is wealth of those who die within the year relative
+    to wealth of the living, the same concept as the model's aggregate
+    bequests without the return factor.
+    """
+    data = _scf_model_age_frame(scf, p, ("networth_infadj",))
+    starting_age = int(getattr(p, "starting_age", 20))
+    rho = _mortality_by_age(p)
+    data["rho"] = rho[data["age"].to_numpy() - starting_age]
+    weighted_wealth = data["wgt"] * data["networth_infadj"]
+    total = weighted_wealth.sum()
+    if np.isclose(total, 0.0):
+        raise ValueError("SCF total wealth is zero.")
+    return float((data["rho"] * weighted_wealth).sum() / total)
+
+
+def model_bequest_flow_ratio(ss_output: dict, p) -> float:
+    """Wealth left by decedents over wealth held, OG-Core bequest timing.
+
+    OG-Core's aggregate bequests are ``(1 + r) * sum(rho * omega * b_sp1)``
+    with ``rho[s]`` the probability of dying at the end of age index ``s``
+    and ``b_sp1[s]`` the savings chosen at that age.  This moment drops the
+    return factor and divides by ``sum(omega * b_sp1)``.
+    """
+    b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
+    joint = _joint_pop_weights(p)
+    rho = _mortality_by_age(p).reshape(-1, 1)
+    total = (joint * b_sp1).sum()
+    if np.isclose(total, 0.0):
+        raise ValueError("Model total wealth is zero.")
+    return float((rho * joint * b_sp1).sum() / total)
+
+
+def tilt_moment_names(
+    config: LifecycleCalibrationConfig, p
+) -> tuple[str, ...]:
+    """Names for the by-bin old-age wealth ratio moments."""
+    n_lo, n_hi = config.tilt_numerator_ages
+    d_lo, d_hi = config.tilt_denominator_ages
+    bins = wealth_share_bin_names(config.tilt_bins(p))
+    return tuple(
+        f"tilt_{name.replace('wealth_share_', '')}_{n_lo}_{n_hi}_over_"
+        f"{d_lo}_{d_hi}"
+        for name in bins
+    )
+
+
+def _bin_mean_wealth(
+    values: np.ndarray, weights: np.ndarray, bin_weights: np.ndarray
+) -> np.ndarray:
+    """Mean wealth in each population bin after sorting by wealth."""
+    values = np.asarray(values, dtype=float).ravel()
+    weights = np.asarray(weights, dtype=float).ravel()
+    shares = percentile_bin_shares(values, weights, bin_weights)
+    mean_all = (values * weights).sum() / weights.sum()
+    return shares * mean_all / _as_vector(bin_weights)
+
+
+def old_age_ratio_by_type_from_scf(
+    scf: pd.DataFrame, p, config: LifecycleCalibrationConfig
+) -> np.ndarray:
+    """Within-band wealth-percentile bin means at old ages over pre-retirement.
+
+    Households in each age band are sorted by net worth and cut into the
+    population bins from ``config.tilt_bins``; the moment is the ratio of
+    bin mean wealth in the numerator band to that in the denominator band.
+    Sorting by wealth within an age band proxies for lifetime-income type.
+    """
+    data = _scf_model_age_frame(scf, p, ("networth_infadj",))
+    bins = config.tilt_bins(p)
+
+    def _means(ages):
+        band = data[data["age"].isin(ages)]
+        if band.empty:
+            raise ValueError("SCF age band for tilt moments is empty.")
+        return _bin_mean_wealth(
+            band["networth_infadj"].to_numpy(), band["wgt"].to_numpy(), bins
+        )
+
+    numerator = _means(config.tilt_numerator_age_labels)
+    denominator = _means(config.tilt_denominator_age_labels)
+    return numerator / denominator
+
+
+def model_old_age_ratio_by_type(
+    ss_output: dict, p, config: LifecycleCalibrationConfig
+) -> np.ndarray:
+    """Model counterpart of :func:`old_age_ratio_by_type_from_scf`."""
+    b_sp1 = np.asarray(ss_output["b_sp1"], dtype=float)
+    joint = _joint_pop_weights(p)
+    bins = config.tilt_bins(p)
+
+    def _means(ages):
+        hold_idx = _age_indices(ages, p)
+        save_idx = _wealth_age_indices(ages, p)
+        return _bin_mean_wealth(b_sp1[save_idx, :], joint[hold_idx, :], bins)
+
+    numerator = _means(config.tilt_numerator_age_labels)
+    denominator = _means(config.tilt_denominator_age_labels)
+    return numerator / denominator
 
 
 def labor_profile_from_cps(
@@ -916,6 +1191,9 @@ def compute_data_moments(
         config.include_wealth_profile
         or config.include_wealth_distribution
         or config.include_old_age_wealth_ratio
+        or config.include_wealth_income_ratio
+        or config.include_bequest_flow_ratio
+        or config.include_old_age_ratio_by_type
     )
     if needs_scf and scf is None:
         scf = load_scf_wealth_data(config)
@@ -954,9 +1232,21 @@ def compute_data_moments(
         )
         values.extend(_data_wealth_distribution_moments(scf, p, config))
 
+    if config.include_wealth_income_ratio:
+        names.append("wealth_income_ratio")
+        values.append(wealth_income_ratio_from_scf(scf, p, config))
+
+    if config.include_bequest_flow_ratio:
+        names.append("bequest_flow_ratio")
+        values.append(bequest_flow_ratio_from_scf(scf, p))
+
     if config.include_old_age_wealth_ratio:
         names.append(old_age_ratio_moment_name(config))
         values.append(old_age_wealth_ratio_from_scf(scf, config))
+
+    if config.include_old_age_ratio_by_type:
+        names.extend(tilt_moment_names(config, p))
+        values.extend(old_age_ratio_by_type_from_scf(scf, p, config))
 
     if config.include_bequest_to_output:
         names.append("bequest_to_output")
@@ -1041,9 +1331,21 @@ def compute_model_moments(
         )
         values.extend(_model_wealth_distribution_moments(ss_output, p, config))
 
+    if config.include_wealth_income_ratio:
+        names.append("wealth_income_ratio")
+        values.append(model_wealth_income_ratio(ss_output, p))
+
+    if config.include_bequest_flow_ratio:
+        names.append("bequest_flow_ratio")
+        values.append(model_bequest_flow_ratio(ss_output, p))
+
     if config.include_old_age_wealth_ratio:
         names.append(old_age_ratio_moment_name(config))
         values.append(model_old_age_wealth_ratio(ss_output, p, config))
+
+    if config.include_old_age_ratio_by_type:
+        names.extend(tilt_moment_names(config, p))
+        values.extend(model_old_age_ratio_by_type(ss_output, p, config))
 
     if config.include_bequest_to_output:
         names.append("bequest_to_output")

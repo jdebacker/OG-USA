@@ -283,8 +283,13 @@ def partial_equilibrium_ss(
     )
     updated = dict(ss_output)
     updated["b_sp1"] = solution.b_sp1
-    updated["b_s"] = np.vstack([np.zeros((1, p.J)), solution.b_sp1[:-1, :]])
+    b_s = np.vstack([np.zeros((1, p.J)), solution.b_sp1[:-1, :]])
+    updated["b_s"] = b_s
     updated["n"] = solution.n
+    updated["before_tax_income"] = np.asarray(
+        household.get_y(env.r_p, env.w, b_s, solution.n, p, "SS"),
+        dtype=float,
+    )
     return updated, solution
 
 
@@ -474,6 +479,407 @@ def invert_chi_n(
         max_abs_log_gap=history[-1],
         history=history,
         capped_ages=ages[capped],
+        ss_output=updated,
+        solution=solution,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: beta by type and chi_b from wealth shares, level, and bequest flow
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PreferenceCalibrationOptions:
+    """
+    Options for the beta / chi_b calibration at fixed prices.
+
+    Attributes:
+        chi_b_mode: ``"common_scale"`` moves every type's ``chi_b`` by one
+            common factor, identified by the aggregate bequest-flow ratio.
+            ``"by_type"`` gives each type group its own ``chi_b`` factor,
+            identified by the old-age wealth tilt of the matching wealth
+            percentile bin, with the bequest-flow ratio as an additional
+            residual.
+        bottom_share: types whose cumulative population share lies in the
+            bottom ``bottom_share`` form the bottom group.
+        top_share: types inside the top ``top_share`` share one ``chi_b``
+            factor in ``by_type`` mode (each still has its own ``beta``).
+        exclude_bottom: when True (default), the bottom group's wealth-share
+            and tilt bins are dropped from the targets and the bottom types
+            share their ``beta`` (and ``chi_b``) factor with the next type
+            up.  A deterministic model with no within-type heterogeneity
+            cannot deliver the SCF bottom-half share of about one percent,
+            because young households of every type fill the bottom
+            percentiles, so targeting it drives the bottom betas to zero.
+            When False the bottom group gets its own factor and one merged
+            share target.
+        bequest_flow_weight: weight on the bequest-flow residual.
+        failure_residual: value of every residual when the household solve
+            fails to converge, in log units.
+        max_nfev: cap on least-squares iterations counted as function
+            evaluations by SciPy; finite-difference Jacobian columns are
+            not counted, so total household solves are about
+            ``max_nfev * (1 + n_params)``.
+        diff_step: relative finite-difference step for the Jacobian.
+        ftol, xtol: least-squares tolerances.
+    """
+
+    chi_b_mode: str = "by_type"
+    bottom_share: float = 0.5
+    top_share: float = 0.01
+    exclude_bottom: bool = True
+    bequest_flow_weight: float = 1.0
+    failure_residual: float = 3.0
+    max_nfev: int = 150
+    diff_step: float = 1e-3
+    ftol: float = 1e-8
+    xtol: float = 1e-8
+
+
+@dataclass
+class PreferenceCalibrationResult:
+    """Outcome of the beta / chi_b calibration at fixed prices."""
+
+    beta_annual: np.ndarray
+    chi_b: np.ndarray
+    theta: np.ndarray
+    residuals: np.ndarray
+    residual_names: tuple
+    data_values: np.ndarray
+    model_values: np.ndarray
+    cost: float
+    nfev: int
+    success: bool
+    message: str
+    ss_output: dict
+    solution: HouseholdSolution | None
+
+    def to_frame(self):
+        """Data, model, and log residual for each target."""
+        import pandas as pd
+
+        return pd.DataFrame(
+            {
+                "target": self.residual_names,
+                "data": self.data_values,
+                "model": self.model_values,
+                "log_residual": self.residuals,
+            }
+        )
+
+
+def _group_bounds(base, groups, lo, hi, transform):
+    """Per-group bounds on an additive shift in transformed space."""
+    lower = np.empty(len(groups))
+    upper = np.empty(len(groups))
+    for g, members in enumerate(groups):
+        t_base = transform(base[members])
+        lower[g] = np.max(transform(lo) - t_base)
+        upper[g] = np.min(transform(hi) - t_base)
+    return lower, upper
+
+
+def _logit(x):
+    x = np.asarray(x, dtype=float)
+    return np.log(x / (1.0 - x))
+
+
+def _logistic(z):
+    return 1.0 / (1.0 + np.exp(-np.asarray(z, dtype=float)))
+
+
+class _PreferenceParameterization:
+    """Map a free parameter vector to beta_annual and chi_b by type."""
+
+    def __init__(self, p, options: PreferenceCalibrationOptions):
+        from ogusa import estimate_lifecycle_params as elp
+
+        self.base_beta = np.asarray(p.beta_annual, dtype=float).copy()
+        self.base_chi_b = np.asarray(p.chi_b, dtype=float).copy()
+        lambdas = elp._lambdas(p)
+        groups = _type_groups(lambdas, options)
+        bottom = groups[0]
+        # beta: the bottom group shares one factor, every other type is free.
+        self.beta_groups = [bottom] + [
+            [j] for j in range(p.J) if j not in bottom
+        ]
+        if options.chi_b_mode == "common_scale":
+            self.chi_b_groups = [list(range(p.J))]
+        elif options.chi_b_mode == "by_type":
+            self.chi_b_groups = groups
+        else:
+            raise ValueError(f"Unsupported chi_b_mode: {options.chi_b_mode}")
+        self.n_beta = len(self.beta_groups)
+        self.n_chi_b = len(self.chi_b_groups)
+        eps = 1e-4
+        b_lo, b_hi = elp._validator_range(p, "beta_annual")
+        b_lo, b_hi = max(b_lo, eps), min(b_hi, 1.0 - eps)
+        c_lo, c_hi = elp._validator_range(p, "chi_b")
+        c_lo = max(c_lo, eps)
+        beta_lo, beta_hi = _group_bounds(
+            self.base_beta, self.beta_groups, b_lo, b_hi, _logit
+        )
+        chi_lo, chi_hi = _group_bounds(
+            self.base_chi_b, self.chi_b_groups, c_lo, c_hi, np.log
+        )
+        self.lower = np.concatenate([beta_lo, chi_lo])
+        self.upper = np.concatenate([beta_hi, chi_hi])
+
+    @property
+    def size(self) -> int:
+        return self.n_beta + self.n_chi_b
+
+    def unpack(self, theta):
+        theta = np.asarray(theta, dtype=float)
+        beta = self.base_beta.copy()
+        for g, members in enumerate(self.beta_groups):
+            beta[members] = _logistic(
+                _logit(self.base_beta[members]) + theta[g]
+            )
+        chi_b = self.base_chi_b.copy()
+        for g, members in enumerate(self.chi_b_groups):
+            chi_b[members] = self.base_chi_b[members] * np.exp(
+                theta[self.n_beta + g]
+            )
+        return beta, chi_b
+
+
+def _type_groups(lambdas, options: PreferenceCalibrationOptions):
+    """Type groups for parameters: bottom merged (plus next type when the
+    bottom bin is excluded), top merged, others single."""
+    from ogusa import estimate_lifecycle_params as elp
+
+    groups = elp.merged_type_groups(
+        lambdas, options.bottom_share, options.top_share
+    )
+    if options.exclude_bottom and len(groups) > 1:
+        bottom = groups[0] + groups[1]
+        groups = [bottom] + groups[2:]
+    return groups
+
+
+def _merge_bins(values, groups):
+    """Sum per-type values over groups."""
+    values = np.asarray(values, dtype=float)
+    return np.array([values[g].sum() for g in groups])
+
+
+def preference_targets(
+    data_moments, p, config, options: PreferenceCalibrationOptions
+):
+    """Select and merge the data moments the beta / chi_b calibration uses.
+
+    Returns names and values for: wealth shares by type bin (the bottom
+    group's bins merged into one target, or dropped when
+    ``options.exclude_bottom``), the wealth-to-income ratio, the by-bin
+    old-age tilts in ``by_type`` mode (bottom tilt bin dropped when
+    ``exclude_bottom``), and the bequest-flow ratio.  The third return value
+    is the selection needed to compute matching model values.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    lookup = dict(zip(data_moments.names, data_moments.values))
+    lambdas = elp._lambdas(p)
+    share_names = elp.wealth_share_bin_names(lambdas)
+    shares = np.array([lookup[name] for name in share_names])
+    raw_groups = elp.merged_type_groups(
+        lambdas, options.bottom_share, options.top_share
+    )
+    bottom = raw_groups[0]
+    if options.exclude_bottom:
+        share_bins = [[j] for j in range(p.J) if j not in bottom]
+    else:
+        share_bins = [bottom] + [[j] for j in range(p.J) if j not in bottom]
+    names = []
+    values = []
+    cum = np.cumsum(lambdas)
+    for members in share_bins:
+        if len(members) == 1:
+            names.append(share_names[members[0]])
+        else:
+            lo = _as_pct(cum[members[0]] - lambdas[members[0]])
+            hi = _as_pct(cum[members[-1]])
+            names.append(f"wealth_share_{lo}_{hi}")
+        values.append(shares[members].sum())
+    names.append("wealth_income_ratio")
+    values.append(lookup["wealth_income_ratio"])
+    tilt_idx = []
+    if options.chi_b_mode == "by_type":
+        tilt_names = elp.tilt_moment_names(config, p)
+        start = 1 if options.exclude_bottom else 0
+        for k in range(start, len(tilt_names)):
+            names.append(tilt_names[k])
+            values.append(lookup[tilt_names[k]])
+            tilt_idx.append(k)
+    names.append("bequest_flow_ratio")
+    values.append(lookup["bequest_flow_ratio"])
+    selection = {"share_bins": share_bins, "tilt_idx": tilt_idx}
+    return tuple(names), np.asarray(values, dtype=float), selection
+
+
+def _as_pct(share):
+    from ogusa import estimate_lifecycle_params as elp
+
+    return elp._percent_label(share)
+
+
+def _preference_model_values(ss_output, p, config, options, selection):
+    from ogusa import estimate_lifecycle_params as elp
+
+    shares = elp.model_wealth_shares(ss_output, p)
+    values = list(_merge_bins(shares, selection["share_bins"]))
+    values.append(elp.model_wealth_income_ratio(ss_output, p))
+    if options.chi_b_mode == "by_type":
+        tilt = elp.model_old_age_ratio_by_type(ss_output, p, config)
+        values.extend(tilt[selection["tilt_idx"]])
+    values.append(elp.model_bequest_flow_ratio(ss_output, p))
+    return np.asarray(values, dtype=float)
+
+
+def _preference_weights(n_targets, options):
+    weights = np.ones(n_targets)
+    weights[-1] = options.bequest_flow_weight
+    return weights
+
+
+def calibrate_beta_chi_b(
+    ss_output: dict,
+    p,
+    data_moments,
+    config=None,
+    options: PreferenceCalibrationOptions | None = None,
+    client=None,
+) -> PreferenceCalibrationResult:
+    """Calibrate beta by type and chi_b at fixed prices.
+
+    Solves a bounded nonlinear least-squares problem over additive shifts
+    to ``logit(beta_annual)`` by type (bottom types tied) and to
+    ``log(chi_b)`` by group, with log residuals between model and data for
+    the merged wealth shares, the wealth-to-income ratio, and the bequest
+    flow ratio (plus by-bin old-age tilts in ``by_type`` mode).  Every
+    residual evaluation is a household-only solve at the prices in
+    ``ss_output``; failed solves return ``options.failure_residual``.
+
+    On return ``p`` carries the calibrated parameters and
+    ``result.ss_output`` the matching household solution.
+    """
+    from scipy import optimize
+
+    from ogusa import estimate_lifecycle_params as elp
+
+    if config is None:
+        config = elp.LifecycleCalibrationConfig()
+    if options is None:
+        options = PreferenceCalibrationOptions()
+    if (
+        options.chi_b_mode == "by_type"
+        and not config.include_old_age_ratio_by_type
+    ):
+        raise ValueError(
+            "chi_b_mode='by_type' needs config.include_old_age_ratio_by_type."
+        )
+    for needed in ("wealth_income_ratio", "bequest_flow_ratio"):
+        if needed not in data_moments.names:
+            raise ValueError(f"data_moments must include {needed}.")
+
+    names, data_values, selection = preference_targets(
+        data_moments, p, config, options
+    )
+    weights = _preference_weights(len(names), options)
+    param = _PreferenceParameterization(p, options)
+    state = {
+        "b_guess": np.asarray(ss_output["b_sp1"], dtype=float),
+        "n_guess": np.asarray(ss_output["n"], dtype=float),
+        "last": None,
+        "nfev": 0,
+    }
+
+    initial_guesses = (state["b_guess"], state["n_guess"])
+
+    def _solve(theta):
+        """Household solve at theta, retrying from the initial guesses."""
+        beta, chi_b = param.unpack(theta)
+        p.update_specifications(
+            {"beta_annual": beta.tolist(), "chi_b": chi_b.tolist()}
+        )
+        guess_sets = [(state["b_guess"], state["n_guess"])]
+        if state["b_guess"] is not initial_guesses[0]:
+            guess_sets.append(initial_guesses)
+        for b_guess, n_guess in guess_sets:
+            updated, solution = partial_equilibrium_ss(
+                ss_output, p, client=client, b_guess=b_guess, n_guess=n_guess
+            )
+            state["nfev"] += 1
+            if solution.all_converged:
+                return updated, solution
+        return updated, solution
+
+    updated0, solution0 = _solve(theta0 := np.zeros(param.size))
+    if not solution0.all_converged:
+        raise RuntimeError(
+            "The household solve did not converge at the starting parameters "
+            "with the guesses in ss_output. Pass an ss_output whose b_sp1 "
+            "and n were solved at the current chi_n (for example the "
+            "ss_output returned by invert_chi_n)."
+        )
+
+    def residuals(theta):
+        updated, solution = _solve(theta)
+        if not solution.all_converged:
+            logger.warning(
+                "Household solve failed at theta=%s; penalizing.",
+                np.round(theta, 4).tolist(),
+            )
+            return np.full(len(names), options.failure_residual)
+        state["b_guess"], state["n_guess"] = solution.b_sp1, solution.n
+        model_values = _preference_model_values(
+            updated, p, config, options, selection
+        )
+        state["last"] = (updated, solution, model_values)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            res = weights * np.log(model_values / data_values)
+        if not np.all(np.isfinite(res)):
+            return np.full(len(names), options.failure_residual)
+        return np.clip(
+            res, -options.failure_residual, options.failure_residual
+        )
+
+    result = optimize.least_squares(
+        residuals,
+        theta0,
+        bounds=(param.lower, param.upper),
+        method="trf",
+        diff_step=options.diff_step,
+        max_nfev=options.max_nfev,
+        ftol=options.ftol,
+        xtol=options.xtol,
+    )
+    # Re-evaluate at the solution so p and the cached state match result.x.
+    final_res = residuals(result.x)
+    beta, chi_b = param.unpack(result.x)
+    if state["last"] is None:
+        raise RuntimeError("No converged household solve during calibration.")
+    updated, solution, model_values = state["last"]
+    logger.info(
+        "beta/chi_b calibration: cost=%.3e, nfev=%d, success=%s, %s",
+        result.cost,
+        state["nfev"],
+        result.success,
+        result.message,
+    )
+    return PreferenceCalibrationResult(
+        beta_annual=beta,
+        chi_b=chi_b,
+        theta=result.x,
+        residuals=final_res,
+        residual_names=names,
+        data_values=data_values,
+        model_values=model_values,
+        cost=float(result.cost),
+        nfev=state["nfev"],
+        success=bool(result.success),
+        message=str(result.message),
         ss_output=updated,
         solution=solution,
     )

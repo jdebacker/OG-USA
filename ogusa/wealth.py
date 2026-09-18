@@ -5,6 +5,16 @@ from ogcore import utils
 
 CUR_PATH = os.path.split(os.path.abspath(__file__))[0]
 SCF_DATA_DIR = os.path.abspath(os.path.join(CUR_PATH, "data", "SCF"))
+# Pre-tax household income and components in the SCF summary extract.
+SCF_INCOME_COLUMNS = [
+    "income",
+    "wageinc",
+    "bussefarminc",
+    "intdivinc",
+    "kginc",
+    "ssretinc",
+    "transfothinc",
+]
 
 
 def get_wealth_data(
@@ -12,6 +22,7 @@ def get_wealth_data(
     web=False,
     directory=None,
     include_age=False,
+    include_income=False,
 ):
     """
     Reads wealth data from the 2007, 2010, 2013, 2016, and 2019 Survey of
@@ -27,6 +38,10 @@ def get_wealth_data(
             stored on local drive, not use internet (web=False)
         include_age (Boolean): =True if function keeps the respondent age
             from the SCF summary extract.
+        include_income (Boolean): =True to keep total pre-tax household
+            income and its components (``income``, ``wageinc``,
+            ``bussefarminc``, ``intdivinc``, ``kginc``, ``ssretinc``,
+            ``transfothinc``) plus ``income_infadj`` in 2019 dollars.
 
 
     Returns:
@@ -101,17 +116,23 @@ def get_wealth_data(
     columns = ["networth", "wgt"]
     if include_age:
         columns.append("age")
+    if include_income:
+        columns.extend(SCF_INCOME_COLUMNS)
     for filename, year in zip(file_paths, scf_yrs_list):
+        cpi = cpi_dict["cpi" + str(year)]
         if filename.endswith(".csv"):
             csv_columns = ["networth", "networth_infadj", "wgt"]
             if include_age:
                 csv_columns.append("age")
+            if include_income:
+                csv_columns.extend(SCF_INCOME_COLUMNS + ["income_infadj"])
             df_yr = pd.read_csv(filename, usecols=csv_columns)
         else:
             df_yr = pd.read_stata(filename, columns=columns)
             # Add inflation adjusted net worth
-            cpi = cpi_dict["cpi" + str(year)]
             df_yr["networth_infadj"] = df_yr["networth"] * (100.0 / cpi)
+            if include_income:
+                df_yr["income_infadj"] = df_yr["income"] * (100.0 / cpi)
         scf_dict[str(year)] = df_yr
 
     df_scf = scf_dict[str(scf_yrs_list[0])]

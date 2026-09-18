@@ -158,13 +158,85 @@ the 10,000 validator cap. If ages 75 to 79 need values near the cap, that
 is the signal to switch the target at those ages to hours conditional on
 working; that decision is the maintainer's.
 
-### Phase 4. Fixed point on beta and chi_b
+### Phase 4. beta by type and chi_b at fixed prices
 
-For types 2 through J, update `beta` in logit space toward each type's own
-share with a damped diagonal secant; tie type 1 to type 2. Update the
-common `chi_b` with a one-dimensional secant on the old-age wealth ratio.
-Both run inside the Phase 2 wrapper. Converge when every share is within
-one bootstrap standard error or within one percent, whichever is looser.
+Status: implemented 2026-09-17 (`calibrate_beta_chi_b`,
+`PreferenceCalibrationOptions` in `ogusa/calibrate_lifecycle.py`), with
+results that call for maintainer decisions listed below.
+
+Design as built (it replaced the damped secant with a bounded nonlinear
+least-squares solve, since each residual evaluation is a half-second
+household solve):
+
+- Free parameters are additive shifts to `logit(beta_annual)` by type and
+  to `log(chi_b)` by type group. `chi_b_mode="by_type"` (default) gives one
+  `chi_b` factor to each of the groups `[1-3], [4], [5], [6], [7-10]`;
+  `"common_scale"` moves every type's `chi_b` by one factor.
+- Targets, all as log model-over-data residuals: wealth shares for the
+  bins of types 3 through 10 (eight), SCF mean wealth over mean income,
+  the by-bin old-age tilt (mean wealth at 80-89 over 60-64 within
+  wealth-percentile bins 50-70, 70-80, 80-90, 90-99, 99-100) in by-type
+  mode, and the bequest-flow ratio (mortality-weighted wealth over total
+  wealth, model mortality on both sides).
+- The bottom-half share bin is excluded and types 1 and 2 share type 3's
+  factors (`exclude_bottom=True`). A deterministic model with no
+  within-type heterogeneity cannot deliver the SCF bottom-half share of
+  about 1.5 percent because young households of every type fill the bottom
+  percentiles; targeting it drove the bottom betas to zero.
+- Failed household solves retry from the initial guesses, then return a
+  bounded penalty. The initial solve must converge or the call raises.
+
+Sensitivity facts that shaped the design (household-only solves at the
+default-parameter prices):
+
+| Change | Total wealth | Bequest flow | Bequest flow / wealth | Wealth 95-99 / 60-64 |
+|---|---|---|---|---|
+| (1 - beta) down 10%, all types | +4.3% | +3.3% | -1.0% | -2.5% |
+| chi_b doubled | +39% | +41% | +1.6% | +5.6% |
+
+Both parameters scale the whole wealth profile; only the tilt toward the
+very old separates them, and it is small. The aggregate 75-79 over 60-64
+ratio from Phase 1 moved 0.2 percent when chi_b doubled and was dropped as
+a target. Type 10's wealth rises only 9 percent when its beta goes from
+0.995 to 0.9999, so top-type wealth is nearly insensitive to beta near one.
+
+Results at the default-parameter equilibrium prices, after the Phase 3
+chi_n inversion, with the bottom bin excluded:
+
+| Mode, income concept | Solves | Time | Betas | chi_b | Notes |
+|---|---|---|---|---|---|
+| by type, SCF total income | 258 | 136 s | 0.96, 0.96, 0.97, 0.94, 0.91, then 0.9999 for types 6-9, 0.994 | 3.3 (types 1-3), 15, 11, 23, 50 (top) | shares within 9% except 99-99.5 bin (-46%); wealth/income 5.0 vs 7.0; tilt bins 50-90 within 8%, 90-99 bin +51%; bequest flow +56% |
+| common scale, SCF total income | 3,726 | 32 min | 0.61, 0.61, 0.64, 0.85, 0.72, 0.99, then 0.9998 | 73 | hit evaluation cap; crawled along the beta/chi_b ridge |
+| common scale, SCF pre-transfer income | 3,643 | 32 min | 0.41, 0.41, 0.45, 0.80, 0.58, 0.97, then 0.9997 | 218 | matched wealth/income 8.3 entirely through chi_b |
+
+The common-scale runs show the identification problem directly: with
+one chi_b factor and a level target, the solver trades low betas for a
+huge bequest motive. The by-type mode converges quickly to plausible
+values because the tilt bins pin each group's chi_b.
+
+Decisions for the maintainer:
+
+1. **Income concept for the level target.** The model's before-tax income
+   (`r_p * B + w * L`) is 0.78 of output; SCF pre-transfer income is about
+   0.62 of GDP and SCF total income about 0.74. The pre-transfer target of
+   8.4 is therefore inflated by an accounting mismatch. The code defaults to
+   `scf_income_concept="pre_transfer"` as requested; the runs above suggest
+   `"total"` (target 7.0) is the more comparable choice, and household net
+   worth over GDP from the Financial Accounts (5.5 versus model 4.9) is a
+   third option.
+2. **Bequest-flow target.** Model 0.030 to 0.040 against data 0.017 in
+   every run. The model's old do not decumulate (no medical expense risk,
+   no annuities, consumption roughly flat with beta times gross return near
+   one), so this gap is structural. Keeping it as a target pulls chi_b down
+   and distorts the betas; treating it as a diagnostic is the alternative.
+3. **The 99 to 99.5 percentile bin** (type 7) is 42 to 46 percent short in
+   every run even with its beta at the upper bound. Type 7's ability
+   profile is 8.5 times the mean at age 45 while the SCF bin holds 18 times
+   mean wealth per person; the shortfall points at the ability profile
+   between types 7 and 8, not at preferences.
+4. **Hours drift.** Changing beta and chi_b at fixed prices moves hours by
+   6 to 14 percent (log), so Phase 5 must alternate the chi_n inversion
+   and this calibration.
 
 ### Phase 5. Outer general-equilibrium loop
 

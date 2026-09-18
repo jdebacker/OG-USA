@@ -21,6 +21,7 @@ class MockParams:
     S = 4
     J = 2
     FOC_root_method = "hybr"
+    e = np.ones((2, 4, 2)) * 1.5
 
 
 def _ss_output(p, scale=1.0):
@@ -189,6 +190,9 @@ def test_partial_equilibrium_ss_updates_household_arrays_only(monkeypatch):
     assert np.allclose(updated["b_s"][1:, 0], 2.0)
     assert np.allclose(updated["n"][:, 1], 0.3 + 2.0)
     assert updated["Y"] == 10.0
+    # Before-tax income is recomputed as r_p * b_s + w * e * n.
+    expected_income = 0.04 * updated["b_s"] + 1.2 * 1.5 * updated["n"]
+    assert np.allclose(updated["before_tax_income"], expected_income)
     assert np.allclose(ss_output["b_sp1"], 1.0)
     assert solution.all_converged is False
 
@@ -433,3 +437,224 @@ def test_invert_chi_n_validates_targets():
     bad[0] = 0.0
     with pytest.raises(ValueError, match="strictly inside"):
         cl.invert_chi_n(ss_output, p, bad, config=config)
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: beta and chi_b calibration
+# ---------------------------------------------------------------------------
+
+
+class MockPrefParams(MockLaborParams):
+    """
+    Parameter object for the beta / chi_b calibration tests.
+    """
+
+    J = 10
+    lambdas = np.array(
+        [0.25, 0.25, 0.2, 0.1, 0.1, 0.09, 0.005, 0.004, 0.0009, 0.0001]
+    ).reshape(10, 1)
+    rho = np.concatenate([np.full(40, 0.002), np.linspace(0.01, 1.0, 40)])
+    _data = {
+        "beta_annual": {"validators": {"range": {"min": 0.0, "max": 0.9999}}},
+        "chi_b": {"validators": {"range": {"min": 0.0, "max": 1e4}}},
+        "chi_n": {"validators": {"range": {"min": 0.0, "max": 1e4}}},
+    }
+
+    def __init__(self, beta_annual, chi_b):
+        super().__init__()
+        self.beta_annual = np.asarray(beta_annual, dtype=float)
+        self.chi_b = np.asarray(chi_b, dtype=float)
+
+    def update_specifications(self, revision):
+        if "beta_annual" in revision:
+            self.beta_annual = np.asarray(revision["beta_annual"], dtype=float)
+        if "chi_b" in revision:
+            self.chi_b = np.asarray(revision["chi_b"], dtype=float)
+        if "chi_n" in revision:
+            super().update_specifications({"chi_n": revision["chi_n"]})
+
+
+def _synthetic_household_block(params):
+    """
+    Wealth that rises with beta at every age and with chi_b at old ages.
+    """
+    S, J = params.S, params.J
+    age = np.arange(S)
+    profile = np.sin(np.pi * (age + 1) / (S + 1)) + 0.05
+    old = np.clip((age - 40) / 39.0, 0.0, 1.0).reshape(S, 1)
+    level = np.exp(40.0 * (params.beta_annual - 0.95)) * (
+        1.0 + np.arange(1, J + 1) ** 2
+    )
+    b = profile.reshape(S, 1) * level.reshape(1, J)
+    b = b * (1.0 + 0.02 * params.chi_b.reshape(1, J) * old)
+    income = np.ones((S, J)) * (1.0 + 0.5 * np.arange(J))
+    return b, income
+
+
+def _fake_pe_from_synthetic():
+    def fake(ss_output, params, client=None, b_guess=None, n_guess=None):
+        b, income = _synthetic_household_block(params)
+        updated = dict(ss_output)
+        updated["b_sp1"] = b
+        updated["n"] = np.ones((params.S, params.J)) * 0.3
+        updated["before_tax_income"] = income
+        return updated, cl.HouseholdSolution(
+            b_sp1=b,
+            n=updated["n"],
+            euler_errors=np.zeros((2 * params.S, params.J)),
+            success=np.ones(params.J, dtype=bool),
+        )
+
+    return fake
+
+
+def _synthetic_targets(p_true, config, options):
+    """
+    Data moments implied by the synthetic block at the true parameters.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    b, income = _synthetic_household_block(p_true)
+    ss = {"b_sp1": b, "before_tax_income": income}
+    names = list(elp.wealth_share_bin_names(p_true.lambdas.ravel()))
+    values = list(elp.model_wealth_shares(ss, p_true))
+    names.append("wealth_income_ratio")
+    values.append(elp.model_wealth_income_ratio(ss, p_true))
+    names.append("bequest_flow_ratio")
+    values.append(elp.model_bequest_flow_ratio(ss, p_true))
+    if options.chi_b_mode == "by_type":
+        names.extend(elp.tilt_moment_names(config, p_true))
+        values.extend(elp.model_old_age_ratio_by_type(ss, p_true, config))
+    return elp.MomentSet(tuple(names), np.array(values))
+
+
+def test_preference_parameterization_groups_and_bounds():
+    """
+    Bottom types share a beta factor; chi_b groups follow the mode.
+    """
+    p = MockPrefParams(np.linspace(0.91, 0.995, 10), np.full(10, 80.0))
+    common = cl._PreferenceParameterization(
+        p,
+        cl.PreferenceCalibrationOptions(
+            chi_b_mode="common_scale", exclude_bottom=False
+        ),
+    )
+    assert common.beta_groups[0] == [0, 1]
+    assert common.n_beta == 9
+    assert common.chi_b_groups == [list(range(10))]
+    assert common.size == 10
+    assert np.all(common.upper > common.lower)
+    beta, chi_b = common.unpack(np.zeros(10))
+    assert np.allclose(beta, p.beta_annual)
+    assert np.allclose(chi_b, p.chi_b)
+    theta = np.zeros(10)
+    theta[-1] = np.log(0.5)
+    _, chi_b_half = common.unpack(theta)
+    assert np.allclose(chi_b_half, 40.0)
+
+    by_type = cl._PreferenceParameterization(
+        p, cl.PreferenceCalibrationOptions(chi_b_mode="by_type")
+    )
+    # Default excludes the bottom bin: bottom types join type 3's group.
+    assert by_type.beta_groups[0] == [0, 1, 2]
+    assert by_type.n_beta == 8
+    assert by_type.chi_b_groups == [[0, 1, 2], [3], [4], [5], [6, 7, 8, 9]]
+    assert by_type.size == 8 + 5
+
+
+@pytest.mark.parametrize("mode", ["common_scale", "by_type"])
+def test_calibrate_beta_chi_b_recovers_synthetic_parameters(monkeypatch, mode):
+    """
+    The least-squares calibration recovers the parameters that generated
+    the targets on a synthetic household block.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    monkeypatch.setattr(
+        cl, "partial_equilibrium_ss", _fake_pe_from_synthetic()
+    )
+    options = cl.PreferenceCalibrationOptions(chi_b_mode=mode, max_nfev=2000)
+    config = elp.LifecycleCalibrationConfig(
+        include_old_age_ratio_by_type=(mode == "by_type")
+    )
+    # With the bottom bin excluded, types 1 to 3 share one factor that
+    # preserves their starting pattern, so the truth keeps them equal.
+    beta_true = np.array(
+        [0.93, 0.93, 0.93, 0.95, 0.955, 0.96, 0.97, 0.975, 0.98, 0.985]
+    )
+    if mode == "common_scale":
+        chi_b_true = np.full(10, 60.0)
+        chi_b_start = np.full(10, 80.0)
+    else:
+        chi_b_true = np.array([30.0, 30.0, 30.0, 70, 90, 110, 60, 60, 60, 60])
+        chi_b_start = np.full(10, 80.0)
+    p_true = MockPrefParams(beta_true, chi_b_true)
+    data_moments = _synthetic_targets(p_true, config, options)
+
+    beta_start = np.linspace(0.92, 0.99, 10)
+    beta_start[:3] = beta_start[2]
+    p = MockPrefParams(beta_start, chi_b_start)
+    ss_output = {
+        "b_sp1": np.ones((p.S, p.J)),
+        "n": np.ones((p.S, p.J)) * 0.3,
+        "before_tax_income": np.ones((p.S, p.J)),
+    }
+    result = cl.calibrate_beta_chi_b(
+        ss_output, p, data_moments, config=config, options=options
+    )
+
+    assert result.success
+    assert result.cost < 1e-8
+    assert np.allclose(result.beta_annual, beta_true, atol=5e-4)
+    assert np.allclose(result.chi_b, chi_b_true, rtol=1e-2)
+    assert np.allclose(p.beta_annual, result.beta_annual)
+    assert np.allclose(result.residuals, 0.0, atol=1e-5)
+    frame = result.to_frame()
+    assert list(frame.columns) == ["target", "data", "model", "log_residual"]
+    assert frame["target"].iloc[0] == "wealth_share_50_70"
+    assert "wealth_share_0_50" not in frame["target"].tolist()
+    if mode == "by_type":
+        assert "tilt_0_50_80_89_over_60_64" not in frame["target"].tolist()
+        assert "tilt_50_70_80_89_over_60_64" in frame["target"].tolist()
+
+
+def test_preference_targets_keep_bottom_bin_when_requested():
+    """
+    exclude_bottom=False merges the bottom bins into one share target.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    p = MockPrefParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    options = cl.PreferenceCalibrationOptions(
+        chi_b_mode="common_scale", exclude_bottom=False
+    )
+    config = elp.LifecycleCalibrationConfig(
+        include_old_age_ratio_by_type=False
+    )
+    names = list(elp.wealth_share_bin_names(p.lambdas.ravel())) + [
+        "wealth_income_ratio",
+        "bequest_flow_ratio",
+    ]
+    values = np.concatenate([np.full(10, 0.1), [7.0, 0.02]])
+    moments = elp.MomentSet(tuple(names), values)
+    target_names, target_values, selection = cl.preference_targets(
+        moments, p, config, options
+    )
+    assert target_names[0] == "wealth_share_0_50"
+    assert np.isclose(target_values[0], 0.2)
+    assert selection["share_bins"][0] == [0, 1]
+    assert len(target_names) == 9 + 2
+
+
+def test_calibrate_beta_chi_b_requires_needed_moments():
+    """
+    Missing level or bequest moments raise a clear error.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    p = MockPrefParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    moments = elp.MomentSet(("wealth_share_0_25",), np.array([0.1]))
+    with pytest.raises(ValueError, match="wealth_income_ratio"):
+        cl.calibrate_beta_chi_b(
+            {"b_sp1": np.ones((80, 10)), "n": np.ones((80, 10))}, p, moments
+        )

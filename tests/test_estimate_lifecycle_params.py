@@ -27,6 +27,7 @@ class MockParams:
     ending_age = 100
     lambdas = LAMBDAS.reshape(10, 1)
     omega_SS = np.ones(80) / 80
+    rho = np.linspace(0.001, 1.0, 80)
     g_n_ss = 0.01
     g_y = 0.02
     delta = 0.05
@@ -93,26 +94,36 @@ def test_default_config_dimensions():
     assert not config.include_income_gini
     assert not config.include_savings_rate
     assert config.include_wealth_distribution
-    assert config.include_old_age_wealth_ratio
+    assert config.include_wealth_income_ratio
+    assert config.include_bequest_flow_ratio
+    assert not config.include_old_age_wealth_ratio
+    assert config.include_old_age_ratio_by_type
 
     ss_output = {
         "n": np.ones((p.S, p.J)) * 0.35,
         "b_sp1": _type_constant_wealth(p)
         * np.linspace(1, 3, p.S).reshape(p.S, 1),
+        "before_tax_income": np.ones((p.S, p.J)) * 0.5,
         "BQ": np.ones(p.J),
         "Y": 10.0,
         "factor": 2.0,
     }
     moments = elp.compute_model_moments(ss_output, p, config)
 
-    assert len(moments.names) == 60 + p.J + 1
+    assert len(moments.names) == 60 + p.J + 2 + 6
     assert moments.names[0] == "labor_supply_age_20"
     assert moments.names[59] == "labor_supply_age_79"
     assert moments.names[60] == "wealth_share_0_25"
     assert moments.names[69] == "wealth_share_99p99_100"
-    assert moments.names[-1] == "old_age_wealth_ratio_75_79_over_60_64"
+    assert moments.names[70] == "wealth_income_ratio"
+    assert moments.names[71] == "bequest_flow_ratio"
+    assert moments.names[72] == "tilt_0_50_80_89_over_60_64"
+    assert moments.names[77] == "tilt_99_100_80_89_over_60_64"
     assert np.allclose(moments.values[:60], 0.35)
     assert np.isclose(moments.values[60:70].sum(), 1.0)
+    assert moments.values[70] > 0
+    assert 0 < moments.values[71] < 1
+    assert np.all(moments.values[72:78] > 1.0)
 
 
 def test_config_validate_rejects_wealth_ages_at_starting_age():
@@ -277,7 +288,9 @@ def test_wealth_profile_model_moment_uses_shifted_index():
     config = elp.LifecycleCalibrationConfig(
         include_labor_profile=False,
         include_wealth_distribution=False,
-        include_old_age_wealth_ratio=False,
+        include_wealth_income_ratio=False,
+        include_bequest_flow_ratio=False,
+        include_old_age_ratio_by_type=False,
         include_wealth_profile=True,
         wealth_profile_moment="level",
     )
@@ -391,29 +404,46 @@ def test_compute_data_moments_with_synthetic_microdata():
             "weight": np.ones(ages.size),
         }
     )
-    scf_ages = rng.integers(21, 80, size=4000)
+    scf_ages = rng.integers(18, 96, size=4000)
+    wealth_values = np.exp(rng.normal(11, 1.5, size=4000)) * (scf_ages / 40.0)
     scf = pd.DataFrame(
         {
             "age": scf_ages,
-            "networth_infadj": np.exp(rng.normal(11, 1.5, size=4000))
-            * (scf_ages / 40.0),
+            "networth_infadj": wealth_values,
             "networth": 1.0,
             "wgt": np.ones(4000),
+            "income": 60000.0 + wealth_values * 0.02,
+            "ssretinc": np.where(scf_ages >= 65, 15000.0, 0.0),
+            "transfothinc": 1000.0,
         }
     )
     config = elp.LifecycleCalibrationConfig()
     moments = elp.compute_data_moments(p, config, cps=cps, scf=scf)
 
-    assert len(moments.names) == 60 + p.J + 1
+    assert len(moments.names) == 60 + p.J + 2 + 6
+    assert moments.names[-6:] == elp.tilt_moment_names(config, p)
+    assert np.all(moments.values[-6:] > 0)
     assert moments.names[60:70] == elp.wealth_share_bin_names(LAMBDAS)
     assert np.isclose(moments.values[60:70].sum(), 1.0, atol=1e-6)
-    assert moments.names[-1] == "old_age_wealth_ratio_75_79_over_60_64"
-    assert moments.values[-1] > 0
+    assert moments.names[70] == "wealth_income_ratio"
+    in_model_ages = scf[scf["age"] >= 20]
+    expected_ratio = (
+        in_model_ages["networth_infadj"].mean()
+        / (
+            in_model_ages["income"]
+            - in_model_ages["ssretinc"]
+            - in_model_ages["transfothinc"]
+        ).mean()
+    )
+    assert np.isclose(moments.values[70], expected_ratio)
+    assert moments.names[71] == "bequest_flow_ratio"
+    assert 0 < moments.values[71] < 1
 
     model_like = elp.compute_model_moments(
         {
             "n": np.ones((p.S, p.J)) * 0.3,
             "b_sp1": _type_constant_wealth(p),
+            "before_tax_income": np.ones((p.S, p.J)),
             "BQ": np.ones(p.J),
             "Y": 10.0,
         },
@@ -441,6 +471,9 @@ def test_compute_data_moments_optional_wealth_profile_and_bequests():
     )
     config = elp.LifecycleCalibrationConfig(
         include_wealth_profile=True,
+        include_wealth_income_ratio=False,
+        include_bequest_flow_ratio=False,
+        include_old_age_ratio_by_type=False,
         include_bequest_to_output=True,
         bequest_to_output_data=0.03,
     )
@@ -463,6 +496,119 @@ def test_compute_data_moments_optional_wealth_profile_and_bequests():
         config,
     )
     assert np.isclose(model.values[-1], 0.5 / 10.0)
+
+
+def test_model_wealth_income_ratio_and_bequest_flow_ratio():
+    """
+    Level and bequest-flow moments follow their population-weighted formulas.
+    """
+    p = MockParams()
+    b_sp1 = np.tile(np.arange(1, p.S + 1, dtype=float).reshape(p.S, 1), p.J)
+    income = np.ones((p.S, p.J)) * 4.0
+    ss_output = {"b_sp1": b_sp1, "before_tax_income": income}
+    joint = elp._joint_pop_weights(p)
+
+    ratio = elp.model_wealth_income_ratio(ss_output, p)
+    # Wealth held by the living excludes the last row of b_sp1 and is
+    # averaged over the whole population, including the starting age.
+    expected = (b_sp1[:-1] * joint[1:]).sum() / joint.sum() / 4.0
+    assert np.isclose(ratio, expected)
+
+    flow = elp.model_bequest_flow_ratio(ss_output, p)
+    rho = p.rho.reshape(-1, 1)
+    assert np.isclose(
+        flow, (rho * joint * b_sp1).sum() / (joint * b_sp1).sum()
+    )
+    assert 0 < flow < 1
+
+
+def test_scf_income_series_and_bequest_flow_from_scf():
+    """
+    SCF income concepts and the mortality-weighted bequest flow.
+    """
+    p = MockParams()
+    scf = pd.DataFrame(
+        {
+            "age": [30, 70, 99, 120, 15],
+            "networth_infadj": [100.0, 300.0, 500.0, 700.0, 900.0],
+            "wgt": [1.0, 1.0, 1.0, 1.0, 1.0],
+            "income": [50.0, 40.0, 30.0, 20.0, 10.0],
+            "ssretinc": [0.0, 20.0, 20.0, 10.0, 0.0],
+            "transfothinc": [1.0, 1.0, 1.0, 1.0, 1.0],
+        }
+    )
+    assert np.allclose(
+        elp.scf_income_series(scf, "pre_transfer"), [49, 19, 9, 9, 9]
+    )
+    assert np.allclose(elp.scf_income_series(scf, "total"), scf["income"])
+    with pytest.raises(ValueError):
+        elp.scf_income_series(scf.drop(columns="income"), "total")
+
+    flow = elp.bequest_flow_ratio_from_scf(scf, p)
+    # Age 15 is dropped; age 120 is clipped to 99, the last model age.
+    rho = p.rho
+    kept = np.array([100.0, 300.0, 500.0, 700.0])
+    rhos = np.array([rho[10], rho[50], rho[79], rho[79]])
+    assert np.isclose(flow, (rhos * kept).sum() / kept.sum())
+
+    config = elp.LifecycleCalibrationConfig()
+    ratio = elp.wealth_income_ratio_from_scf(scf, p, config)
+    assert np.isclose(ratio, kept.mean() / np.mean([49, 19, 9, 9]))
+
+
+def test_tilt_bins_merge_top_one_percent():
+    """
+    Default tilt bins are lambdas with the top one percent merged.
+    """
+    p = MockParams()
+    config = elp.LifecycleCalibrationConfig()
+    bins = config.tilt_bins(p)
+    assert np.allclose(bins, [0.5, 0.2, 0.1, 0.1, 0.09, 0.01])
+    names = elp.tilt_moment_names(config, p)
+    assert len(names) == 6
+    assert names[0] == "tilt_0_50_80_89_over_60_64"
+    assert names[-1] == "tilt_99_100_80_89_over_60_64"
+    assert elp.merged_type_groups(LAMBDAS) == [
+        [0, 1],
+        [2],
+        [3],
+        [4],
+        [5],
+        [6, 7, 8, 9],
+    ]
+    assert elp.merged_type_groups([0.6, 0.4]) == [[0], [1]]
+
+
+def test_old_age_ratio_by_type_model_and_data():
+    """
+    With wealth scaled by age, every bin's tilt equals the age scaling.
+    """
+    p = MockParams()
+    config = elp.LifecycleCalibrationConfig(include_old_age_ratio_by_type=True)
+    age_scale = np.linspace(1.0, 3.0, p.S).reshape(p.S, 1)
+    b_sp1 = _type_constant_wealth(p) * age_scale
+    model = elp.model_old_age_ratio_by_type({"b_sp1": b_sp1}, p, config)
+    hold_num = elp._age_indices(config.tilt_numerator_age_labels, p)
+    hold_den = elp._age_indices(config.tilt_denominator_age_labels, p)
+    expected = age_scale[hold_num - 1].mean() / age_scale[hold_den - 1].mean()
+    assert model.shape == (6,)
+    assert np.allclose(model, expected, rtol=1e-6)
+
+    rng = np.random.default_rng(3)
+    ages = np.concatenate(
+        [rng.integers(60, 65, 3000), rng.integers(80, 90, 3000)]
+    )
+    base = np.exp(rng.normal(11, 1.0, size=6000))
+    scf = pd.DataFrame(
+        {
+            "age": ages,
+            "networth_infadj": base * np.where(ages >= 80, 0.8, 1.0),
+            "wgt": 1.0,
+        }
+    )
+    data = elp.old_age_ratio_by_type_from_scf(scf, p, config)
+    assert data.shape == (6,)
+    assert np.all(data > 0)
 
 
 def test_savings_rate_data_moment_uses_macro_moment(monkeypatch):

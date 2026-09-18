@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `ogusa/calibrate_lifecycle.py`: household-only steady-state solve (`HouseholdEnvironment`, `solve_households`, `partial_equilibrium_ss`) that re-solves every lifetime-income type's Euler equations at fixed prices, transfers, bequests, and scaling factor from an OG-Core steady-state output. It reproduces the general-equilibrium household solution at equilibrium prices in well under a second serially and is the inner loop for the preference-parameter calibration.
+- `ogusa/calibrate_lifecycle.py`: `calibrate_beta_chi_b` calibrates `beta_annual` by type and `chi_b` by type group at fixed prices with bounded nonlinear least squares over household-only solves, targeting SCF wealth shares by type bin, SCF mean wealth over mean income, by-bin old-age wealth tilts, and the mortality-weighted bequest-flow ratio. `PreferenceCalibrationOptions` selects the `chi_b` grouping and whether the structurally unmatchable bottom-half bin is excluded.
+- New moments in `estimate_lifecycle_params.py`: `wealth_income_ratio` (SCF mean net worth over mean income, pre-transfer or total concept), `bequest_flow_ratio` (wealth of decedents over wealth of the living using the model's mortality on both sides), and by-bin old-age tilts (`tilt_*`); `merged_type_groups` and `percentile_bin_shares` helpers.
+- SCF extracts in `ogusa/data/SCF` now carry total pre-tax income and its components (`data/download_moment_data.py`); `wealth.get_wealth_data` accepts `include_income`.
 - `ogusa/calibrate_lifecycle.py`: `invert_chi_n` chooses the `chi_n` age profile so population-weighted model hours match CPS hours at each age 20 to 79 at fixed prices, by iterating on the labor first-order condition (`chi_n_update`). Ages beyond the last target are filled by the configured tail method, values are clipped to the ParamTools range, and ages where the cap binds are reported.
 
 ### Changed
