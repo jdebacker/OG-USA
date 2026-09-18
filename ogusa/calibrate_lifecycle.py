@@ -1135,7 +1135,7 @@ def calibrate_lifecycle_preferences(
     data_moments=None,
     initial_ss: dict | None = None,
     max_outer: int = 15,
-    param_tol: float = 1e-3,
+    param_tol: float = 1e-2,
     price_tol: float = 1e-3,
     outer_damping: float = 1.0,
     adaptive_damping: bool = True,
@@ -1152,7 +1152,11 @@ def calibrate_lifecycle_preferences(
     with the old ones by ``outer_damping`` in transformed space, and
     re-solve the general equilibrium warm-started from the previous
     solution.  Stops when the largest transformed-parameter change and the
-    largest relative price change both fall below their tolerances.
+    largest relative price change both fall below their tolerances.  The
+    parameter tolerance is looser than the price tolerance by default
+    because beta and chi_b trade off along a ridge that leaves the moments
+    unchanged, so transformed parameters can drift at the percent level
+    after prices and moments have settled.
 
     With ``adaptive_damping`` the damping factor halves whenever the
     parameter change fails to shrink by at least ten percent from one pass
