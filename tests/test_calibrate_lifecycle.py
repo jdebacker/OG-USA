@@ -876,3 +876,33 @@ def test_calibrate_lifecycle_preferences_converges_with_fakes(monkeypatch):
     )
     assert not short.converged
     assert short.iterations == 1
+
+
+def test_preference_parameterization_respects_bounds_at_ceiling():
+    """
+    Parameters already at a ceiling stay within it after a round trip.
+    """
+    beta = np.linspace(0.92, 0.99, 10)
+    beta[5:9] = 0.9999
+    p = MockPrefParams(beta, np.full(10, 80.0))
+    param = cl._PreferenceParameterization(
+        p, cl.PreferenceCalibrationOptions()
+    )
+    beta_out, chi_b_out = param.unpack(param.upper)
+    assert np.all(beta_out <= 0.9999)
+    assert np.all(chi_b_out <= 1e4)
+    beta_lo, _ = param.unpack(param.lower)
+    assert np.all(beta_lo >= 1e-4)
+
+    capped = cl._PreferenceParameterization(
+        p,
+        cl.PreferenceCalibrationOptions(
+            beta_annual_max=0.995, chi_b_max=100.0
+        ),
+    )
+    beta_cap, chi_b_cap = capped.unpack(np.zeros(capped.size))
+    assert np.all(beta_cap <= 0.995)
+    assert np.isclose(beta_cap[5], 0.995)
+    beta_up, chi_b_up = capped.unpack(capped.upper)
+    assert np.all(beta_up <= 0.995 + 1e-12)
+    assert np.all(chi_b_up <= 100.0 + 1e-9)

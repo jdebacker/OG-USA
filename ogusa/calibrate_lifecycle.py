@@ -505,6 +505,9 @@ class PreferenceCalibrationOptions:
             bottom ``bottom_share`` form the bottom group.
         top_share: types inside the top ``top_share`` share one ``chi_b``
             factor in ``by_type`` mode (each still has its own ``beta``).
+        beta_annual_max, chi_b_max: optional ceilings tighter than the
+            ParamTools validators (the validator caps are 0.9999 and
+            10,000).
         exclude_bottom: when True (default), the bottom group's wealth-share
             and tilt bins are dropped from the targets and the bottom types
             share their ``beta`` (and ``chi_b``) factor with the next type
@@ -529,6 +532,8 @@ class PreferenceCalibrationOptions:
     bottom_share: float = 0.5
     top_share: float = 0.01
     exclude_bottom: bool = True
+    beta_annual_max: float | None = None
+    chi_b_max: float | None = None
     bequest_flow_weight: float = 1.0
     failure_residual: float = 3.0
     max_nfev: int = 150
@@ -615,8 +620,17 @@ class _PreferenceParameterization:
         eps = 1e-4
         b_lo, b_hi = elp._validator_range(p, "beta_annual")
         b_lo, b_hi = max(b_lo, eps), min(b_hi, 1.0 - eps)
+        if options.beta_annual_max is not None:
+            b_hi = min(b_hi, float(options.beta_annual_max))
         c_lo, c_hi = elp._validator_range(p, "chi_b")
         c_lo = max(c_lo, eps)
+        if options.chi_b_max is not None:
+            c_hi = min(c_hi, float(options.chi_b_max))
+        # Base values may already sit on a bound; keep them inside it.
+        self.base_beta = np.clip(self.base_beta, b_lo, b_hi)
+        self.base_chi_b = np.clip(self.base_chi_b, c_lo, c_hi)
+        self.beta_bounds = (b_lo, b_hi)
+        self.chi_b_bounds = (c_lo, c_hi)
         beta_lo, beta_hi = _group_bounds(
             self.base_beta, self.beta_groups, b_lo, b_hi, _logit
         )
@@ -642,6 +656,10 @@ class _PreferenceParameterization:
             chi_b[members] = self.base_chi_b[members] * np.exp(
                 theta[self.n_beta + g]
             )
+        # Round-tripping through logit/log at a bound can overshoot it by
+        # floating-point error, which ParamTools rejects; clip to be safe.
+        beta = np.clip(beta, *self.beta_bounds)
+        chi_b = np.clip(chi_b, *self.chi_b_bounds)
         return beta, chi_b
 
 
