@@ -238,6 +238,18 @@ Decisions for the maintainer:
    6 to 14 percent (log), so Phase 5 must alternate the chi_n inversion
    and this calibration.
 
+General-equilibrium re-solve with the by-type parameters and the Phase 3
+`chi_n` (serial, 157 seconds after two failed initial guesses): the
+interest rate rose from 4.3 to 5.6 percent, output fell 40 percent, the
+income scaling factor rose 71 percent, hours ended 10 to 27 percent (log)
+above target, wealth over income fell to 4.6 against 7.0, and the top-1%
+bins stayed within 9 percent while the 80-90 bin dropped 25 percent below
+target. The tilt bins moved the most (the 50-70 bin from -7 to -49
+percent), so the type-specific chi_b factors are sensitive to prices.
+Phase 5 must therefore iterate to convergence rather than apply one pass,
+and the higher interest rate means the fixed-price step overstates how
+much saving the calibrated parameters deliver.
+
 ### Phase 5. Outer general-equilibrium loop
 
 Solve the full steady state, run Phases 3 and 4, re-solve warm-started from
