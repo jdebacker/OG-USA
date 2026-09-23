@@ -110,6 +110,7 @@ uv run python examples/run_ogusa.py
 - `transfer_distribution.py`: Government transfer matrix (`eta`) by age/ability
 - `estimate_beta_j.py`: Legacy SMM for time preference by ability type
 - `estimate_lifecycle_params.py`: Moment construction (CPS hours by age, SCF wealth shares with bins from `p.lambdas`, old-age wealth ratio) and an optional DFO-LS SMM inference driver for `beta_annual`, `chi_b`, `chi_n`
+- `calibrate_lifecycle.py`: Nested calibration of `beta_annual`, `chi_b`, `chi_n` (household-only solves, `chi_n` inversion, `beta`/`chi_b` least squares, warm-started GE outer loop, standard errors via `preference_inference`); example flow in `examples/run_lifecycle_calibration.py`, time-path check in `examples/validate_lifecycle_time_path.py`
 - `compute_moments.py`: Data moments from FRED, CPS, SCF, PSID, and Tax-Calculator
 - Default PSID data: `psid_lifetime_income.csv.gz`; trimmed CPS and SCF extracts in `ogusa/data/`
 
@@ -141,7 +142,7 @@ uv run python examples/run_ogusa.py
 3. Instantiate `Calibration` class with options:
    - `estimate_tax_functions`: Estimate from microdata or load cached
    - `estimate_beta`: Estimate time preference (legacy path)
-   - `estimate_chi_n`: Estimate labor disutility (being reworked; see the plan)
+   - `estimate_lifecycle_prefs`: Calibrate `beta_annual` by type, `chi_b`, and the `chi_n` age profile with the nested general-equilibrium routine (`calibrate_lifecycle.calibrate_lifecycle_preferences`); `lifecycle_params_path` caches the result as JSON. `estimate_chi_n` is a deprecated alias.
    - `estimate_pop`: Estimate demographics from UN data
 4. Get calibrated parameters with `c.get_dict()`
 5. Update `Specifications`: `p.update_specifications(c.get_dict())`

@@ -1,6 +1,6 @@
 # Plan: calibrating beta, chi_b, and chi_n in OG-USA
 
-Status as of 2026-09-16. Branch: `smm`.
+Status as of 2026-09-21. Branch: `smm`.
 
 ## Background
 
@@ -326,16 +326,101 @@ What the two runs say together:
 
 ### Phase 6. Integrate and validate
 
-- Wire the routine into the `Calibration` class behind a flag; `get_dict`
-  returns `beta_annual`, `chi_b`, and `chi_n`.
-- Replace `check_smm.py` with an example script that runs the calibration,
-  writes the moment comparison, and plots hours and wealth profiles in
-  matching units.
-- Validate with a baseline and one reform time path, since large `chi_n`
-  at old ages is the most likely place for the time-path solver to struggle.
-- Optionally run DFO-LS from the calibrated point over the beta and chi_b
-  parameters with household-only evaluations for standard errors and an
-  overidentification test (`compute_parameter_vcv`).
+Status: done 2026-09-21.
+
+- Done: `Calibration(p, estimate_lifecycle_prefs=True)` runs
+  `calibrate_lifecycle_preferences` on a deep copy of `p` that already
+  carries the class's other outputs (tax functions, `e`, `eta`, `zeta`,
+  demographics, macro parameters), so the preferences are consistent with
+  the rest of `get_dict()`, which now returns `beta_annual`, `chi_b`, and
+  `chi_n`. `lifecycle_params_path` mirrors the tax-function cache: a JSON
+  whose `S` and `J` match is read instead of re-calibrated, otherwise the
+  calibration runs and writes it (with a `_meta` block recording
+  convergence). `lifecycle_config`, `lifecycle_options`,
+  `lifecycle_initial_ss`, and `lifecycle_kwargs` pass through.
+  `estimate_chi_n` is a deprecated alias (with a warning) because `chi_n`
+  is only meaningful jointly with `beta` and `chi_b`. The legacy
+  `estimate_beta` path, which passed the class instance as the initial
+  guess and read an attribute that was never set, was repaired in passing.
+- Done: `check_smm.py` (untracked) removed. `examples/run_lifecycle_calibration.py`
+  runs the calibration through the class and writes `calibrated_params.json`,
+  `moment_comparison.csv` (data, model, log gap), `outer_loop_history.csv`,
+  optional `preference_standard_errors.csv`, and the hours (share of the
+  112-hour endowment against CPS), wealth (2019 dollars against SCF), and
+  `chi_n` figures by reusing `plot_lifecycle_calibration.py`.
+  `examples/validate_lifecycle_time_path.py` solves the baseline and a
+  reform (corporate rate 35 percent) transition path at calibrated
+  parameters, solving steady states serially and the time path under Dask,
+  and records convergence, Euler errors, and the macro comparison table.
+- Done: `preference_inference` in `calibrate_lifecycle.py` gives standard
+  errors for `beta` and `chi_b` from the household-only Jacobian that
+  `calibrate_beta_chi_b` now stores (SciPy's `least_squares` Jacobian at
+  the solution, so no extra solves are needed at the calibrated point).
+  Two forms: classical nonlinear least squares, or a sandwich with a
+  bootstrap covariance of the data moments mapped to the merged targets by
+  `preference_target_selection`; the latter also yields the Hansen-type
+  overidentification statistic on `m - k` degrees of freedom. DFO-LS was
+  not needed for this: the calibration already is a least-squares problem
+  with an analytic-enough Jacobian from finite differences.
+- Time-path validation at the pre-transfer-income, bequest-flow
+  calibration (`calibrated_params_pretransfer_bq.json`), six Dask workers
+  for the transition path:
+
+  | Run | Wall time | Max Euler error (savings, labor) | Outcome |
+  |---|---|---|---|
+  | Baseline | 8.1 min | 2.3e-12, 3.1e-12 | converged |
+  | Reform (corporate rate 35 percent) | 8.4 min (plus 15 s serial SS) | 2.3e-12, 3.2e-12 | converged |
+
+  The large old-age `chi_n` (5,300 to 7,400 at ages 75 to 79) gave the
+  time-path solver no trouble: household Euler errors are at machine
+  precision on both paths and the outer loops converged normally. The
+  reform's macro effects are the expected sign (GDP -0.7 percent, capital
+  -1.9 percent, and labor +0.03 percent over 2026-2035; steady-state GDP
+  -0.8 percent, capital -2.5 percent, wage -1.0 percent). Output in
+  `examples/lifecycle_calibration/time_path_validation/` (gitignored).
+  One wrinkle: Dask's `client.close()` timed out at the end of the first
+  run, which the script now tolerates; run records are written per run so
+  `--summarize-only` can rebuild the table.
+- Found while adding the standard errors: SciPy's `diff_step` in
+  `least_squares` is relative to the parameter value, and the calibration
+  parameterizes shifts that start at zero, so the Jacobian in Phase 4 and
+  5 was built with steps of about 1.5e-8 against household solves that
+  are reproducible to about 1e-6. The returned Jacobian had entries of
+  1e4 to 1e12 and many exact zeros. `calibrate_beta_chi_b` now supplies
+  its own forward-difference Jacobian with an absolute step of 1e-3 from
+  a common household guess; the columns match manual derivatives
+  (magnitudes 0.01 to 0.7). The calibration reached its fit despite the
+  noisy Jacobian (`trf` is robust to it), but the ridge wandering between
+  `beta` and `chi_b` noted in Phase 5 may partly reflect it.
+- Full calibration re-run through the `Calibration` class with the fixed
+  Jacobian (`examples/run_lifecycle_calibration.py`, default options,
+  serial): 7 outer passes, 30 minutes, converged with damping never
+  reduced (Phase 5 needed 8 passes and a damping cut). Parameter changes
+  by pass: 5.7, 1.9, 0.20, 0.089, 0.014, 0.0049, 0.0024; price changes
+  fell to 0.0009. Household solves in the beta/chi_b step per pass: 1,740,
+  212, 127, 353, 239, 141, 113. Results are within rounding of the Phase 5
+  run: betas 0.953 (types 1-3), 0.959, 0.933, 0.9999 (types 6-9), 0.997;
+  chi_b 9.1 (types 1-3), 24.7, 20.0, 33.1, 75.9 (top); chi_n 526 at 20,
+  71 to 75 over 30-45, 157 at 60, 392 at 65, 1,566 at 70, 5,331 at 75,
+  7,182 at 79. Hours match to a 0.0006 log gap; wealth-share and tilt fits
+  are unchanged from Phase 5 (the same structural gaps: 99-99.5 share -49
+  percent, wealth over income 5.4 against 8.4, bequest flow 0.030 against
+  0.017, top tilts +19 to +31 percent). Outputs in
+  `examples/lifecycle_calibration/` (`calibrated_params.json`,
+  `moment_comparison.csv`, `outer_loop_history.csv`,
+  `preference_standard_errors.csv`, figures).
+- Standard errors (sandwich form, 200 SCF/CPS row-bootstrap draws,
+  4 of 13 parameters fixed at the beta ceiling): beta 0.004 for types 1-3,
+  0.023 for types 4-5, 0.005 for type 10; chi_b 1.2 (types 1-3), 6.3, 5.9,
+  9.4, 10.3 (top). The overidentification statistic is 2,234 on 6 degrees
+  of freedom: with row-bootstrap sampling variances this small, the
+  structural misfit in the wealth level, bequest flow, and top-end tilts is
+  overwhelmingly rejected, which is the statistical face of the Phase 5
+  conclusion that the model needs return heterogeneity or a stronger
+  top-end bequest motive to reach the SCF wealth concentration.
+
+Remaining for Phase 6: none of the listed items. Open questions carry over
+to the modelling side (see the Phase 5 discussion).
 
 ## Tests
 
@@ -344,6 +429,25 @@ What the two runs say together:
 - The household-only wrapper reproduces general-equilibrium savings and
   hours when handed equilibrium prices.
 - The full calibration gets a `local` marker.
+- `Calibration` wiring: the lifecycle routine sees a copy of `p` carrying
+  `e` and `eta`, `get_dict` returns the three parameters, a saved JSON is
+  reused and a dimension mismatch triggers re-calibration
+  (`tests/test_calibrate.py`).
+- `preference_target_selection` reproduces the targets from the full
+  moment vector; `preference_inference` returns finite standard errors in
+  both forms with tied types sharing one standard error, and treats a
+  parameter on its bound as fixed (`tests/test_calibrate_lifecycle.py`).
+- The Jacobian stored by `calibrate_beta_chi_b` equals a manual forward
+  difference with the absolute step on the synthetic household block;
+  `_theta_from_p` / `_apply_theta` round-trip; `_price_change` and
+  `_chi_n_bounds` behave as documented (`tests/test_calibrate_lifecycle.py`).
+- `read_lifecycle_parameters` branches (missing file, missing keys,
+  dimension mismatch, consistent file) and `_parameter_updates`
+  (`tests/test_calibrate.py`).
+- Example-script helpers: `history_frame`, `moment_frame`,
+  `standard_errors` (with the inner steps faked), `tpi_summary`,
+  `run_one` (success, saved steady state, and TPI failure), and
+  `load_default_spec` (`tests/test_lifecycle_examples.py`).
 
 ## Order and dependencies
 
