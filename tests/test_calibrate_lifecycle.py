@@ -8,6 +8,7 @@ from importlib import resources
 from types import SimpleNamespace
 
 import numpy as np
+from dataclasses import replace
 import pytest
 
 from ogusa import calibrate_lifecycle as cl
@@ -906,3 +907,201 @@ def test_preference_parameterization_respects_bounds_at_ceiling():
     beta_up, chi_b_up = capped.unpack(capped.upper)
     assert np.all(beta_up <= 0.995 + 1e-12)
     assert np.all(chi_b_up <= 100.0 + 1e-9)
+
+
+def test_preference_target_selection_reproduces_targets():
+    """
+    The selection matrix maps the full moment vector onto the calibration
+    targets, summing merged share bins.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    options = cl.PreferenceCalibrationOptions(
+        chi_b_mode="by_type", exclude_bottom=False
+    )
+    config = elp.LifecycleCalibrationConfig()
+    p = MockPrefParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    data = _synthetic_targets(p, config, options)
+    A = cl.preference_target_selection(data, p, config, options)
+    names, values, _ = cl.preference_targets(data, p, config, options)
+    assert A.shape == (len(names), len(data.names))
+    assert np.allclose(A @ data.values, values)
+    # Bottom two types merged into one share target.
+    assert A[0].sum() == 2 and names[0] == "wealth_share_0_50"
+    assert np.all(A[1:].sum(axis=1) == 1)
+    assert set(np.unique(A)) <= {0.0, 1.0}
+
+
+def test_preference_inference_shapes_and_methods(monkeypatch):
+    """
+    Standard errors come from the least-squares Jacobian; a moment
+    covariance switches on the sandwich form and the J test.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    monkeypatch.setattr(
+        cl, "partial_equilibrium_ss", _fake_pe_from_synthetic()
+    )
+    options = cl.PreferenceCalibrationOptions(chi_b_mode="by_type")
+    config = elp.LifecycleCalibrationConfig()
+    beta_true = np.array(
+        [0.93, 0.93, 0.93, 0.95, 0.955, 0.96, 0.97, 0.975, 0.98, 0.985]
+    )
+    chi_b_true = np.array([30.0, 30.0, 30.0, 70, 90, 110, 60, 60, 60, 60])
+    p_true = MockPrefParams(beta_true, chi_b_true)
+    data = _synthetic_targets(p_true, config, options)
+    # Perturb the data so the fit is not exact.
+    noisy = elp.MomentSet(
+        data.names,
+        data.values * np.exp(0.02 * np.cos(np.arange(len(data.names)))),
+    )
+    p = MockPrefParams(beta_true.copy(), chi_b_true.copy())
+    ss_output = {
+        "b_sp1": np.ones((p.S, p.J)),
+        "n": np.ones((p.S, p.J)) * 0.3,
+        "before_tax_income": np.ones((p.S, p.J)),
+    }
+    result = cl.calibrate_beta_chi_b(
+        ss_output, p, noisy, config=config, options=options
+    )
+    m = len(result.residual_names)
+    k = result.theta.size
+    assert result.jacobian.shape == (m, k)
+    assert result.weights.shape == (m,)
+
+    nls = cl.preference_inference(result, p, options=options)
+    assert nls.method == "nls"
+    assert nls.n_moments == m and nls.n_params == k
+    assert nls.theta_se.shape == (k,)
+    assert nls.beta_se.shape == (p.J,) and nls.chi_b_se.shape == (p.J,)
+    assert np.all(np.isfinite(nls.theta_se)) and np.all(nls.theta_se >= 0)
+    assert np.isnan(nls.j_stat)
+    # Tied bottom types share a standard error (delta method by group).
+    assert np.isclose(nls.beta_se[0], nls.beta_se[1])
+    assert np.allclose(nls.chi_b_se[6:], nls.chi_b_se[6])
+    frame = nls.to_frame(p)
+    assert list(frame.columns) == [
+        "type",
+        "beta_annual",
+        "beta_se",
+        "beta_at_bound",
+        "chi_b",
+        "chi_b_se",
+        "chi_b_at_bound",
+    ]
+
+    A = cl.preference_target_selection(noisy, p, config, options)
+    full_vcv = np.diag((0.05 * noisy.values) ** 2)
+    sandwich = cl.preference_inference(
+        result, p, options=options, moment_vcv=A @ full_vcv @ A.T
+    )
+    assert sandwich.method == "sandwich"
+    assert sandwich.j_df == m - k > 0
+    assert np.isfinite(sandwich.j_stat) and sandwich.j_stat >= 0
+    assert 0.0 <= sandwich.j_pvalue <= 1.0
+    assert np.all(sandwich.theta_se > 0)
+
+    with pytest.raises(ValueError):
+        cl.preference_inference(
+            result, p, options=options, moment_vcv=np.eye(m + 1)
+        )
+
+    # A parameter on its bound is treated as fixed: NaN standard error,
+    # one fewer free parameter, one more degree of freedom.
+    param = cl._PreferenceParameterization(p, options)
+    pinned = replace(result, theta=result.theta.copy())
+    pinned.theta[3] = param.upper[3]
+    fixed = cl.preference_inference(pinned, p, options=options)
+    assert fixed.at_bound[3] and fixed.at_bound.sum() == 1
+    assert fixed.n_params == k - 1 and fixed.j_df == m - k + 1
+    assert np.isnan(fixed.theta_se[3]) and np.isnan(fixed.beta_se[5])
+    assert np.all(np.isfinite(np.delete(fixed.theta_se, 3)))
+    frame = fixed.to_frame(p)
+    assert frame["beta_at_bound"].tolist().count(True) == 1
+
+
+def test_calibrate_beta_chi_b_jacobian_matches_manual_differences(
+    monkeypatch,
+):
+    """
+    The Jacobian stored on the result is a forward difference with the
+    absolute step in options.diff_step, not SciPy's relative step.
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    fake_pe = _fake_pe_from_synthetic()
+    monkeypatch.setattr(cl, "partial_equilibrium_ss", fake_pe)
+    options = cl.PreferenceCalibrationOptions(
+        chi_b_mode="by_type", max_nfev=1, diff_step=1e-3
+    )
+    config = elp.LifecycleCalibrationConfig()
+    beta = np.array(
+        [0.93, 0.93, 0.93, 0.95, 0.955, 0.96, 0.97, 0.975, 0.98, 0.985]
+    )
+    chi_b = np.array([30.0, 30.0, 30.0, 70, 90, 110, 60, 60, 60, 60])
+    data = _synthetic_targets(MockPrefParams(beta, chi_b), config, options)
+    noisy = elp.MomentSet(data.names, data.values * 1.05)
+    p = MockPrefParams(beta.copy(), chi_b.copy())
+    ss_output = {
+        "b_sp1": np.ones((p.S, p.J)),
+        "n": np.ones((p.S, p.J)) * 0.3,
+        "before_tax_income": np.ones((p.S, p.J)),
+    }
+    result = cl.calibrate_beta_chi_b(
+        ss_output, p, noisy, config=config, options=options
+    )
+    # One iteration only: the solution is the starting point.
+    assert np.allclose(result.theta, 0.0, atol=1e-8)
+
+    names, dvals, selection = cl.preference_targets(noisy, p, config, options)
+    param = cl._PreferenceParameterization(
+        MockPrefParams(beta, chi_b), options
+    )
+    weights = cl._preference_weights(len(names), options)
+
+    def resid(theta):
+        b, c = param.unpack(theta)
+        q = MockPrefParams(b, c)
+        updated, _ = fake_pe(ss_output, q)
+        model = cl._preference_model_values(
+            updated, q, config, options, selection
+        )
+        return weights * np.log(model / dvals)
+
+    r0 = resid(np.zeros(param.size))
+    manual = np.empty_like(result.jacobian)
+    for k in range(param.size):
+        h = 1e-3 if param.upper[k] > 1e-3 else -1e-3
+        shifted = np.zeros(param.size)
+        shifted[k] = h
+        manual[:, k] = (resid(shifted) - r0) / h
+    assert result.jacobian.shape == manual.shape
+    assert np.allclose(result.jacobian, manual, rtol=1e-6, atol=1e-9)
+    assert np.linalg.norm(manual) > 0.1
+
+
+def test_theta_roundtrip_price_change_and_chi_n_bounds():
+    """
+    Transformed-parameter stacking inverts, price changes are relative,
+    and chi_n bounds come from the validators unless overridden.
+    """
+    p = MockGEParams(np.linspace(0.92, 0.99, 10), np.full(10, 80.0))
+    theta = cl._theta_from_p(p)
+    assert theta.shape == (2 * p.J + p.S,)
+    cl._apply_theta(theta + 0.1, p)
+    assert np.allclose(cl._theta_from_p(p), theta + 0.1)
+    assert np.all(p.beta_annual < 1.0)
+
+    old = _ge_output(p, r_p=0.04)
+    new = dict(old, r_p=0.044, BQ=old["BQ"] * 1.5)
+    biggest, changes = cl._price_change(new, old)
+    assert changes["r_p"] == pytest.approx(0.1)
+    assert changes["BQ"] == pytest.approx(0.5)
+    assert changes["w"] == 0.0
+    assert biggest == pytest.approx(0.5)
+
+    lower, upper = cl._chi_n_bounds(p, None, None)
+    assert lower == pytest.approx(0.0, abs=1e-6) and upper == 1e4
+    assert cl._chi_n_bounds(p, 1.0, 500.0) == (1.0, 500.0)
+    cl.apply_chi_n(p, np.full(p.S, 3.0))
+    assert np.allclose(p.chi_n[-1, :], 3.0)

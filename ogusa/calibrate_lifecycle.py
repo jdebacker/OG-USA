@@ -30,15 +30,17 @@ class HouseholdEnvironment:
     Everything the household block takes as given in the steady state.
 
     Attributes:
-        r_p: return on the household portfolio.
-        w: wage rate.
-        p_tilde: composite consumption good price.
-        p_i: consumption good prices, length I.
-        bq: bequests received by age and type, shape (S, J).
-        rm: remittances received by age and type, shape (S, J).
-        tr: government transfers received by age and type, shape (S, J).
-        ubi: universal basic income by age and type, shape (S, J).
-        factor: scaling factor from model units to dollars.
+        r_p (float): return on the household portfolio
+        w (float): wage rate
+        p_tilde (float): composite consumption good price
+        p_i (Numpy array): consumption good prices, length I
+        bq (Numpy array): bequests received by age and type, shape (S, J)
+        rm (Numpy array): remittances received by age and type, shape (S, J)
+        tr (Numpy array): government transfers received by age and type,
+            shape (S, J)
+        ubi (Numpy array): universal basic income by age and type, shape
+            (S, J)
+        factor (float): scaling factor from model units to dollars
     """
 
     r_p: float
@@ -53,7 +55,8 @@ class HouseholdEnvironment:
 
     @classmethod
     def from_ss_output(cls, ss_output: dict, p) -> "HouseholdEnvironment":
-        """Build the environment from an OG-Core steady-state output dict.
+        """
+        Builds the household environment from an OG-Core steady-state output.
 
         The output dictionary written by ``SS.run_SS`` already carries the
         household-level arrays (``bq``, ``rm``, ``tr``, ``ubi``) and prices
@@ -61,6 +64,14 @@ class HouseholdEnvironment:
         from an older pickle, they are rebuilt from the aggregates ``BQ``,
         ``RM``, ``TR``, ``Y``, and ``p_m`` with the same OG-Core helpers the
         steady-state inner loop uses.
+
+        Args:
+            ss_output (dict): OG-Core steady-state output
+            p (OG-Core Specifications object): parameters object
+
+        Returns:
+            env (HouseholdEnvironment): prices, transfers, bequests, and
+                scaling factor held fixed in household-only solves
         """
         factor = float(ss_output["factor"])
         if all(key in ss_output for key in _HOUSEHOLD_INPUT_KEYS):
@@ -105,7 +116,17 @@ class HouseholdEnvironment:
 
 @dataclass
 class HouseholdSolution:
-    """Household savings and labor supply from a partial-equilibrium solve."""
+    """
+    Household savings and labor supply from a partial-equilibrium solve.
+
+    Attributes:
+        b_sp1 (Numpy array): savings chosen at each age, shape (S, J)
+        n (Numpy array): labor supply at each age, shape (S, J)
+        euler_errors (Numpy array): savings and labor Euler equation
+            errors, shape (2S, J)
+        success (Numpy array): whether each type's root finder reported
+            success, boolean of length J
+    """
 
     b_sp1: np.ndarray
     n: np.ndarray
@@ -114,20 +135,38 @@ class HouseholdSolution:
 
     @property
     def max_abs_euler_error(self) -> float:
-        """Largest absolute Euler equation error across ages and types."""
+        """
+        Largest absolute Euler equation error across ages and types.
+
+        Returns:
+            max_error (float): largest absolute Euler equation error
+        """
         return float(np.max(np.abs(self.euler_errors)))
 
     @property
     def all_converged(self) -> bool:
-        """Whether every type's root finder reported success."""
+        """
+        Whether every type's root finder reported success.
+
+        Returns:
+            converged (bool): True when all J types converged
+        """
         return bool(np.all(self.success))
 
 
 def _consumption_good_prices(p_m: np.ndarray, p) -> np.ndarray:
-    """Consumption good prices from production good prices.
+    """
+    Computes consumption good prices from production good prices.
 
     Newer OG-Core releases expose ``aggregates.get_io_prices``; older ones
     compute the prices inline as ``io_matrix @ p_m``.
+
+    Args:
+        p_m (Numpy array): production good prices, length M
+        p (OG-Core Specifications object): parameters object
+
+    Returns:
+        p_i (Numpy array): consumption good prices, length I
     """
     get_io_prices = getattr(aggr, "get_io_prices", None)
     if get_io_prices is not None:
@@ -137,12 +176,20 @@ def _consumption_good_prices(p_m: np.ndarray, p) -> np.ndarray:
 
 
 def _scatter_params(p, client):
-    """Scatter the parameters object to Dask workers once.
+    """
+    Scatters the parameters object to Dask workers once.
 
     Uses ``SS.scatter_params`` when the installed OG-Core provides it.
     Otherwise it mirrors the steady-state inner loop: the ParamTools schema
     objects are unpicklable, so they are detached before scattering and
     restored afterwards.
+
+    Args:
+        p (OG-Core Specifications object): parameters object
+        client (Dask Client object): client
+
+    Returns:
+        scattered_p (Dask Future object): the parameters on the workers
     """
     scatter = getattr(SS, "scatter_params", None)
     if scatter is not None:
@@ -166,7 +213,22 @@ def _scatter_params(p, client):
 
 
 def _solve_one_type(env, p_or_future, guesses, j):
-    """Call ``SS.solve_for_j`` for one type with the environment unpacked."""
+    """
+    Calls ``SS.solve_for_j`` for one lifetime-income type.
+
+    Args:
+        env (HouseholdEnvironment): prices, transfers, and scaling factor
+        p_or_future (OG-Core Specifications object or Dask Future
+            object): parameters object, possibly already scattered to
+            the workers
+        guesses (Numpy array): stacked savings and labor guesses for type
+            ``j``, length 2S
+        j (int): lifetime-income type index
+
+    Returns:
+        result (SciPy OptimizeResult object): root-finder output with
+            ``x`` (savings then labor) and ``fun`` (Euler errors)
+    """
     return SS.solve_for_j(
         guesses,
         env.r_p,
@@ -191,21 +253,24 @@ def solve_households(
     client=None,
     scattered_p=None,
 ) -> HouseholdSolution:
-    """Solve every type's lifecycle problem at a fixed environment.
+    """
+    Solves every type's lifecycle problem at a fixed environment.
 
     Args:
-        env: prices, transfers, and scaling factor held fixed.
-        p: OG-Core Specifications object (current preference parameters).
-        b_guess: initial savings guesses, shape (S, J).
-        n_guess: initial labor guesses, shape (S, J).
-        client: optional Dask client; types are solved in parallel when
-            given, with a serial fallback if the parallel run fails.
-        scattered_p: optional Dask future for ``p`` already scattered to the
-            workers, to avoid re-scattering on repeated calls.
+        env (HouseholdEnvironment): prices, transfers, and scaling factor
+            held fixed
+        p (OG-Core Specifications object): parameters object with the
+            current preference parameters
+        b_guess (Numpy array): initial savings guesses, shape (S, J)
+        n_guess (Numpy array): initial labor guesses, shape (S, J)
+        client (Dask Client object): client; types are solved in parallel
+            when given, with a serial fallback if the parallel run fails
+        scattered_p (Dask Future object): ``p`` already scattered to the
+            workers, to avoid re-scattering on repeated calls
 
     Returns:
-        HouseholdSolution with savings, labor, Euler errors (2S x J), and
-        per-type convergence flags.
+        solution (HouseholdSolution): savings, labor, Euler errors
+            (2S x J), and per-type convergence flags
     """
     b_guess = np.asarray(b_guess, dtype=float)
     n_guess = np.asarray(n_guess, dtype=float)
@@ -264,14 +329,31 @@ def partial_equilibrium_ss(
     n_guess: np.ndarray | None = None,
     scattered_p=None,
 ) -> tuple[dict, HouseholdSolution]:
-    """Re-solve the household block at the prices in ``ss_output``.
+    """
+    Re-solves the household block at the prices in ``ss_output``.
 
-    Returns a copy of ``ss_output`` with ``b_sp1``, ``b_s``, and ``n``
-    replaced by the new household solution (aggregates such as ``BQ``,
-    ``Y``, and ``factor`` are left at their general-equilibrium values), so
-    the result can be passed straight to
-    :func:`ogusa.estimate_lifecycle_params.compute_model_moments`.  The
-    second return value carries Euler errors and convergence flags.
+    Aggregates such as ``BQ``, ``Y``, and ``factor`` are left at their
+    general-equilibrium values, so the result can be passed straight to
+    ``ogusa.estimate_lifecycle_params.compute_model_moments``.
+
+    Args:
+        ss_output (dict): OG-Core steady-state output supplying prices,
+            transfers, bequests, and the scaling factor
+        p (OG-Core Specifications object): parameters object with the
+            current preference parameters
+        client (Dask Client object): client for parallel solves
+        b_guess (Numpy array): initial savings guesses, shape (S, J);
+            defaults to ``ss_output["b_sp1"]``
+        n_guess (Numpy array): initial labor guesses, shape (S, J);
+            defaults to ``ss_output["n"]``
+        scattered_p (Dask Future object): ``p`` already scattered to the
+            workers
+
+    Returns:
+        updated (dict): copy of ``ss_output`` with ``b_sp1``, ``b_s``,
+            ``n``, and ``before_tax_income`` replaced by the new household
+            solution
+        solution (HouseholdSolution): Euler errors and convergence flags
     """
     env = HouseholdEnvironment.from_ss_output(ss_output, p)
     if b_guess is None:
@@ -300,7 +382,24 @@ def partial_equilibrium_ss(
 
 @dataclass
 class ChiNInversionResult:
-    """Outcome of the chi_n inversion at fixed prices."""
+    """
+    Outcome of the chi_n inversion at fixed prices.
+
+    Attributes:
+        chi_n (Numpy array): steady-state chi_n by age, length S
+        ages (Numpy array): ages at which hours were targeted
+        labor_model (Numpy array): population-weighted model hours at
+            ``ages``
+        labor_target (Numpy array): target hours at ``ages``
+        iterations (int): number of inversion steps taken
+        converged (bool): whether the log gap fell below the tolerance
+        max_abs_log_gap (float): largest absolute log gap between model and
+            target hours at the end
+        history (list): largest absolute log gap after each step
+        capped_ages (Numpy array): ages where chi_n hit a bound
+        ss_output (dict): household solution at the final chi_n
+        solution (HouseholdSolution): Euler errors and convergence flags
+    """
 
     chi_n: np.ndarray
     ages: np.ndarray
@@ -316,7 +415,17 @@ class ChiNInversionResult:
 
 
 def aggregate_labor_by_age(n: np.ndarray, p, ages: np.ndarray) -> np.ndarray:
-    """Population-weighted mean labor supply at each requested age."""
+    """
+    Computes population-weighted mean labor supply at each requested age.
+
+    Args:
+        n (Numpy array): labor supply by age and type, shape (S, J)
+        p (OG-Core Specifications object): parameters object
+        ages (Numpy array): ages to aggregate over
+
+    Returns:
+        labor (Numpy array): mean labor supply at each age in ``ages``
+    """
     from ogusa import estimate_lifecycle_params as elp
 
     n = np.asarray(n, dtype=float)
@@ -332,7 +441,8 @@ def chi_n_update(
     p,
     damping: float = 1.0,
 ) -> np.ndarray:
-    """One inversion step of the labor first-order condition.
+    """
+    Takes one inversion step of the labor first-order condition.
 
     The steady-state labor FOC is ``chi_n[s] * MDU(n) = LHS[s]`` where the
     right-hand side depends on wages, taxes, and consumption.  Holding that
@@ -341,6 +451,17 @@ def chi_n_update(
     to a power: 1 is the full step, below 1 damps, above 1 over-relaxes to
     offset the consumption response that makes hours move less than the
     fixed-LHS step predicts.
+
+    Args:
+        chi_n_values (Numpy array): current chi_n at the target ages
+        labor_model (Numpy array): model hours at the target ages
+        labor_target (Numpy array): target hours at the target ages
+        p (OG-Core Specifications object): parameters object (supplies
+            ``ltilde`` and ``upsilon``)
+        damping (float): exponent on the update ratio
+
+    Returns:
+        chi_n_new (Numpy array): updated chi_n at the target ages
     """
     chi_n_values = np.asarray(chi_n_values, dtype=float)
     ratio = household.marg_ut_labor(
@@ -350,14 +471,34 @@ def chi_n_update(
 
 
 def apply_chi_n(p, chi_n: np.ndarray) -> None:
-    """Set the steady-state chi_n age profile on the spec (validated)."""
+    """
+    Sets the steady-state chi_n age profile on the parameters object.
+
+    Args:
+        p (OG-Core Specifications object): parameters object
+        chi_n (Numpy array): chi_n by age, length S
+
+    Returns:
+        None
+    """
     p.update_specifications(
         {"chi_n": np.asarray(chi_n, dtype=float).reshape(-1).tolist()}
     )
 
 
 def _chi_n_bounds(p, chi_n_min: float | None, chi_n_max: float | None):
-    """Natural bounds for chi_n from the validators unless overridden."""
+    """
+    Returns bounds for chi_n from the validators unless overridden.
+
+    Args:
+        p (OG-Core Specifications object): parameters object
+        chi_n_min (float or None): lower bound override
+        chi_n_max (float or None): upper bound override
+
+    Returns:
+        lower (float): lower bound on chi_n
+        upper (float): upper bound on chi_n
+    """
     from ogusa import estimate_lifecycle_params as elp
 
     lo, hi = elp._validator_range(p, "chi_n")
@@ -378,14 +519,15 @@ def invert_chi_n(
     chi_n_max: float | None = None,
     client=None,
 ) -> ChiNInversionResult:
-    """Choose chi_n by age so model hours match ``labor_target`` at fixed prices.
+    """
+    Chooses chi_n by age so model hours match ``labor_target`` at fixed prices.
 
     Iterates: solve the household block at the prices in ``ss_output``,
     form population-weighted hours at each target age, update ``chi_n`` at
-    those ages with :func:`chi_n_update`, and repeat until the largest
-    absolute log gap between model and target hours is below ``tol``.
-    Ages above the last target age are filled with
-    :func:`ogusa.estimate_lifecycle_params.build_chi_n_profile` using
+    those ages with ``chi_n_update``, and repeat until the largest absolute
+    log gap between model and target hours is below ``tol``.  Ages above the
+    last target age are filled with
+    ``ogusa.estimate_lifecycle_params.build_chi_n_profile`` using
     ``config.chi_n_tail_method`` (default: the initial profile's tail
     rescaled to join the last estimated value).  Values are clipped to the
     ParamTools range for ``chi_n`` unless narrower bounds are given, and the
@@ -393,7 +535,24 @@ def invert_chi_n(
 
     On return ``p`` carries the final ``chi_n`` and ``result.ss_output`` is
     the household solution at that profile, ready for
-    :func:`ogusa.estimate_lifecycle_params.compute_model_moments`.
+    ``ogusa.estimate_lifecycle_params.compute_model_moments``.
+
+    Args:
+        ss_output (dict): OG-Core steady-state output supplying prices
+        p (OG-Core Specifications object): parameters object; updated in place
+        labor_target (Numpy array): target hours at ``config.moment_ages``
+        config (LifecycleCalibrationConfig): moment configuration; default
+            configuration when None
+        max_iter (int): maximum number of inversion steps
+        tol (float): convergence tolerance on the absolute log gap
+        damping (float): exponent on the update ratio in ``chi_n_update``
+        chi_n_min (float or None): lower bound override for chi_n
+        chi_n_max (float or None): upper bound override for chi_n
+        client (Dask Client object): client for household solves
+
+    Returns:
+        result (ChiNInversionResult): calibrated profile, fit, and the
+            household solution at the final chi_n
     """
     from dataclasses import replace
 
@@ -495,37 +654,45 @@ class PreferenceCalibrationOptions:
     Options for the beta / chi_b calibration at fixed prices.
 
     Attributes:
-        chi_b_mode: ``"common_scale"`` moves every type's ``chi_b`` by one
-            common factor, identified by the aggregate bequest-flow ratio.
-            ``"by_type"`` gives each type group its own ``chi_b`` factor,
-            identified by the old-age wealth tilt of the matching wealth
-            percentile bin, with the bequest-flow ratio as an additional
-            residual.
-        bottom_share: types whose cumulative population share lies in the
-            bottom ``bottom_share`` form the bottom group.
-        top_share: types inside the top ``top_share`` share one ``chi_b``
-            factor in ``by_type`` mode (each still has its own ``beta``).
-        beta_annual_max, chi_b_max: optional ceilings tighter than the
-            ParamTools validators (the validator caps are 0.9999 and
-            10,000).
-        exclude_bottom: when True (default), the bottom group's wealth-share
-            and tilt bins are dropped from the targets and the bottom types
-            share their ``beta`` (and ``chi_b``) factor with the next type
-            up.  A deterministic model with no within-type heterogeneity
-            cannot deliver the SCF bottom-half share of about one percent,
-            because young households of every type fill the bottom
-            percentiles, so targeting it drives the bottom betas to zero.
-            When False the bottom group gets its own factor and one merged
-            share target.
-        bequest_flow_weight: weight on the bequest-flow residual.
-        failure_residual: value of every residual when the household solve
-            fails to converge, in log units.
-        max_nfev: cap on least-squares iterations counted as function
-            evaluations by SciPy; finite-difference Jacobian columns are
-            not counted, so total household solves are about
-            ``max_nfev * (1 + n_params)``.
-        diff_step: relative finite-difference step for the Jacobian.
-        ftol, xtol: least-squares tolerances.
+        chi_b_mode (str): ``"common_scale"`` moves every type's ``chi_b``
+            by one common factor, identified by the aggregate bequest-flow
+            ratio. ``"by_type"`` gives each type group its own ``chi_b``
+            factor, identified by the old-age wealth tilt of the matching
+            wealth percentile bin, with the bequest-flow ratio as an
+            additional residual.
+        bottom_share (float): types whose cumulative population share lies
+            in the bottom ``bottom_share`` form the bottom group
+        top_share (float): types inside the top ``top_share`` share one
+            ``chi_b`` factor in ``by_type`` mode (each still has its own
+            ``beta``)
+        exclude_bottom (bool): when True (default), the bottom group's
+            wealth-share and tilt bins are dropped from the targets and the
+            bottom types share their ``beta`` (and ``chi_b``) factor with
+            the next type up.  A deterministic model with no within-type
+            heterogeneity cannot deliver the SCF bottom-half share of about
+            one percent, because young households of every type fill the
+            bottom percentiles, so targeting it drives the bottom betas to
+            zero.  When False the bottom group gets its own factor and one
+            merged share target.
+        beta_annual_max (float or None): ceiling on beta tighter than the
+            ParamTools validator (0.9999)
+        chi_b_max (float or None): ceiling on chi_b tighter than the
+            ParamTools validator (10,000)
+        bequest_flow_weight (float): weight on the bequest-flow residual
+        failure_residual (float): value of every residual when the
+            household solve fails to converge, in log units
+        max_nfev (int): cap on least-squares function evaluations counted
+            by SciPy; Jacobian columns are not counted, so total household
+            solves are about ``max_nfev * (1 + n_params)``
+        diff_step (float): absolute finite-difference step for the
+            Jacobian, in the transformed parameter space (shifts to
+            ``logit(beta)`` and ``log(chi_b)``).  Every column is
+            differenced from the same household guess so solver noise does
+            not enter the derivatives.  SciPy's own ``diff_step`` is
+            relative to the parameter value and would fall back to about
+            1.5e-8 here because the parameterization starts at zero.
+        ftol (float): least-squares cost tolerance
+        xtol (float): least-squares parameter tolerance
     """
 
     chi_b_mode: str = "by_type"
@@ -544,7 +711,28 @@ class PreferenceCalibrationOptions:
 
 @dataclass
 class PreferenceCalibrationResult:
-    """Outcome of the beta / chi_b calibration at fixed prices."""
+    """
+    Outcome of the beta / chi_b calibration at fixed prices.
+
+    Attributes:
+        beta_annual (Numpy array): calibrated beta by type, length J
+        chi_b (Numpy array): calibrated chi_b by type, length J
+        theta (Numpy array): free parameters at the solution (transformed
+            shifts)
+        residuals (Numpy array): weighted log residuals at the solution
+        residual_names (tuple): target names, one per residual
+        data_values (Numpy array): data value of each target
+        model_values (Numpy array): model value of each target
+        cost (float): least-squares cost, half the sum of squared residuals
+        nfev (int): number of household solves used
+        success (bool): SciPy's convergence flag
+        message (str): SciPy's termination message
+        ss_output (dict): household solution at the calibrated parameters
+        solution (HouseholdSolution or None): Euler errors and flags
+        jacobian (Numpy array or None): Jacobian of the residuals at the
+            solution, shape (targets, free parameters)
+        weights (Numpy array or None): residual weights, one per target
+    """
 
     beta_annual: np.ndarray
     chi_b: np.ndarray
@@ -559,9 +747,17 @@ class PreferenceCalibrationResult:
     message: str
     ss_output: dict
     solution: HouseholdSolution | None
+    jacobian: np.ndarray | None = None
+    weights: np.ndarray | None = None
 
     def to_frame(self):
-        """Data, model, and log residual for each target."""
+        """
+        Tabulates data, model, and log residual for each target.
+
+        Returns:
+            frame (Pandas DataFrame): columns ``target``, ``data``, ``model``,
+                ``log_residual``
+        """
         import pandas as pd
 
         return pd.DataFrame(
@@ -575,7 +771,20 @@ class PreferenceCalibrationResult:
 
 
 def _group_bounds(base, groups, lo, hi, transform):
-    """Per-group bounds on an additive shift in transformed space."""
+    """
+    Computes per-group bounds on an additive shift in transformed space.
+
+    Args:
+        base (Numpy array): base parameter values by type
+        groups (list): lists of type indices sharing one shift
+        lo (float): lower bound on the parameter in levels
+        hi (float): upper bound on the parameter in levels
+        transform (function): map from levels to the transformed space
+
+    Returns:
+        lower (Numpy array): lower bound on each group's shift
+        upper (Numpy array): upper bound on each group's shift
+    """
     lower = np.empty(len(groups))
     upper = np.empty(len(groups))
     for g, members in enumerate(groups):
@@ -586,18 +795,65 @@ def _group_bounds(base, groups, lo, hi, transform):
 
 
 def _logit(x):
+    """
+    Logit transform.
+
+    Args:
+        x (Numpy array or float): values in (0, 1)
+
+    Returns:
+        z (Numpy array or float): ``log(x / (1 - x))``
+    """
     x = np.asarray(x, dtype=float)
     return np.log(x / (1.0 - x))
 
 
 def _logistic(z):
+    """
+    Logistic transform, the inverse of ``_logit``.
+
+    Args:
+        z (Numpy array or float): real values
+
+    Returns:
+        x (Numpy array or float): ``1 / (1 + exp(-z))``
+    """
     return 1.0 / (1.0 + np.exp(-np.asarray(z, dtype=float)))
 
 
 class _PreferenceParameterization:
-    """Map a free parameter vector to beta_annual and chi_b by type."""
+    """
+    Maps a free parameter vector to beta_annual and chi_b by type.
+
+    The free parameters are additive shifts to ``logit(beta_annual)`` for
+    each beta group and to ``log(chi_b)`` for each chi_b group, relative to
+    the values on the parameters object when the instance was created.
+
+    Attributes:
+        base_beta (Numpy array): starting beta by type, clipped to bounds
+        base_chi_b (Numpy array): starting chi_b by type, clipped to bounds
+        beta_groups (list): lists of type indices sharing one beta shift
+        chi_b_groups (list): lists of type indices sharing one chi_b shift
+        n_beta (int): number of beta groups
+        n_chi_b (int): number of chi_b groups
+        beta_bounds (tuple): (lower, upper) bounds on beta in levels
+        chi_b_bounds (tuple): (lower, upper) bounds on chi_b in levels
+        lower (Numpy array): lower bounds on the free parameters
+        upper (Numpy array): upper bounds on the free parameters
+    """
 
     def __init__(self, p, options: PreferenceCalibrationOptions):
+        """
+        Builds the parameterization from the current parameters and options.
+
+        Args:
+            p (OG-Core Specifications object): parameters object with
+                the starting beta and chi_b
+            options (PreferenceCalibrationOptions): grouping and bound options
+
+        Returns:
+            None
+        """
         from ogusa import estimate_lifecycle_params as elp
 
         self.base_beta = np.asarray(p.beta_annual, dtype=float).copy()
@@ -642,9 +898,29 @@ class _PreferenceParameterization:
 
     @property
     def size(self) -> int:
+        """
+        Number of free parameters.
+
+        Returns:
+            size (int): beta groups plus chi_b groups
+        """
         return self.n_beta + self.n_chi_b
 
     def unpack(self, theta):
+        """
+        Maps free parameters to beta_annual and chi_b by type.
+
+        Round-tripping through logit/log at a bound can overshoot it by
+        floating-point error, which ParamTools rejects, so the results are
+        clipped to the bounds.
+
+        Args:
+            theta (Numpy array): free parameters, length ``size``
+
+        Returns:
+            beta (Numpy array): beta_annual by type, length J
+            chi_b (Numpy array): chi_b by type, length J
+        """
         theta = np.asarray(theta, dtype=float)
         beta = self.base_beta.copy()
         for g, members in enumerate(self.beta_groups):
@@ -664,8 +940,20 @@ class _PreferenceParameterization:
 
 
 def _type_groups(lambdas, options: PreferenceCalibrationOptions):
-    """Type groups for parameters: bottom merged (plus next type when the
-    bottom bin is excluded), top merged, others single."""
+    """
+    Forms the type groups for the parameters.
+
+    The bottom types are merged (plus the next type when the bottom bin is
+    excluded from the targets), the top types are merged, and every other
+    type stands alone.
+
+    Args:
+        lambdas (Numpy array): population share of each type
+        options (PreferenceCalibrationOptions): grouping options
+
+    Returns:
+        groups (list): lists of type indices, in order from bottom to top
+    """
     from ogusa import estimate_lifecycle_params as elp
 
     groups = elp.merged_type_groups(
@@ -678,7 +966,16 @@ def _type_groups(lambdas, options: PreferenceCalibrationOptions):
 
 
 def _merge_bins(values, groups):
-    """Sum per-type values over groups."""
+    """
+    Sums per-type values over groups.
+
+    Args:
+        values (Numpy array): one value per type
+        groups (list): lists of type indices
+
+    Returns:
+        merged (Numpy array): one sum per group
+    """
     values = np.asarray(values, dtype=float)
     return np.array([values[g].sum() for g in groups])
 
@@ -686,14 +983,27 @@ def _merge_bins(values, groups):
 def preference_targets(
     data_moments, p, config, options: PreferenceCalibrationOptions
 ):
-    """Select and merge the data moments the beta / chi_b calibration uses.
+    """
+    Selects and merges the data moments the beta / chi_b calibration uses.
 
-    Returns names and values for: wealth shares by type bin (the bottom
-    group's bins merged into one target, or dropped when
-    ``options.exclude_bottom``), the wealth-to-income ratio, the by-bin
-    old-age tilts in ``by_type`` mode (bottom tilt bin dropped when
-    ``exclude_bottom``), and the bequest-flow ratio.  The third return value
-    is the selection needed to compute matching model values.
+    Targets are: wealth shares by type bin (the bottom group's bins merged
+    into one target, or dropped when ``options.exclude_bottom``), the
+    wealth-to-income ratio, the by-bin old-age tilts in ``by_type`` mode
+    (bottom tilt bin dropped when ``exclude_bottom``), and the bequest-flow
+    ratio.
+
+    Args:
+        data_moments (MomentSet): full data moment vector
+        p (OG-Core Specifications object): parameters object
+        config (LifecycleCalibrationConfig): moment configuration
+        options (PreferenceCalibrationOptions): grouping options
+
+    Returns:
+        names (tuple): target names
+        values (Numpy array): target values
+        selection (dict): ``share_bins`` (lists of type indices per share
+            target) and ``tilt_idx`` (indices of the tilt bins used), needed
+            to compute matching model values
     """
     from ogusa import estimate_lifecycle_params as elp
 
@@ -737,12 +1047,34 @@ def preference_targets(
 
 
 def _as_pct(share):
+    """
+    Formats a population share as a percentile label.
+
+    Args:
+        share (float): cumulative population share
+
+    Returns:
+        label (str): percentile label such as ``"99p5"``
+    """
     from ogusa import estimate_lifecycle_params as elp
 
     return elp._percent_label(share)
 
 
 def _preference_model_values(ss_output, p, config, options, selection):
+    """
+    Computes the model values matching ``preference_targets``.
+
+    Args:
+        ss_output (dict): household solution
+        p (OG-Core Specifications object): parameters object
+        config (LifecycleCalibrationConfig): moment configuration
+        options (PreferenceCalibrationOptions): grouping options
+        selection (dict): the selection returned by ``preference_targets``
+
+    Returns:
+        values (Numpy array): model value of each target
+    """
     from ogusa import estimate_lifecycle_params as elp
 
     shares = elp.model_wealth_shares(ss_output, p)
@@ -756,6 +1088,17 @@ def _preference_model_values(ss_output, p, config, options, selection):
 
 
 def _preference_weights(n_targets, options):
+    """
+    Builds the residual weights for the beta / chi_b targets.
+
+    Args:
+        n_targets (int): number of targets
+        options (PreferenceCalibrationOptions): supplies the bequest-flow
+            weight, applied to the last target
+
+    Returns:
+        weights (Numpy array): one weight per target
+    """
     weights = np.ones(n_targets)
     weights[-1] = options.bequest_flow_weight
     return weights
@@ -769,7 +1112,8 @@ def calibrate_beta_chi_b(
     options: PreferenceCalibrationOptions | None = None,
     client=None,
 ) -> PreferenceCalibrationResult:
-    """Calibrate beta by type and chi_b at fixed prices.
+    """
+    Calibrates beta by type and chi_b at fixed prices.
 
     Solves a bounded nonlinear least-squares problem over additive shifts
     to ``logit(beta_annual)`` by type (bottom types tied) and to
@@ -777,10 +1121,29 @@ def calibrate_beta_chi_b(
     the merged wealth shares, the wealth-to-income ratio, and the bequest
     flow ratio (plus by-bin old-age tilts in ``by_type`` mode).  Every
     residual evaluation is a household-only solve at the prices in
-    ``ss_output``; failed solves return ``options.failure_residual``.
+    ``ss_output``; failed solves return ``options.failure_residual``.  The
+    Jacobian is formed by forward differences with the absolute step
+    ``options.diff_step``, every column from the same household guess.
 
     On return ``p`` carries the calibrated parameters and
     ``result.ss_output`` the matching household solution.
+
+    Args:
+        ss_output (dict): household solution at the current chi_n whose
+            ``b_sp1`` and ``n`` serve as starting guesses (for example the
+            ``ss_output`` returned by ``invert_chi_n``)
+        p (OG-Core Specifications object): parameters object; updated in place
+        data_moments (MomentSet): data moments including the wealth shares,
+            ``wealth_income_ratio``, ``bequest_flow_ratio``, and tilts
+        config (LifecycleCalibrationConfig): moment configuration; default
+            configuration when None
+        options (PreferenceCalibrationOptions): calibration options;
+            defaults when None
+        client (Dask Client object): client for household solves
+
+    Returns:
+        result (PreferenceCalibrationResult): calibrated parameters, fit,
+            Jacobian, and the household solution
     """
     from scipy import optimize
 
@@ -816,7 +1179,17 @@ def calibrate_beta_chi_b(
     initial_guesses = (state["b_guess"], state["n_guess"])
 
     def _solve(theta):
-        """Household solve at theta, retrying from the initial guesses."""
+        """
+        Solves the household block at ``theta``, retrying from the initial
+        guesses when the warm guess fails.
+
+        Args:
+            theta (Numpy array): free parameters
+
+        Returns:
+            updated (dict): household solution as ``ss_output``
+            solution (HouseholdSolution): Euler errors and convergence flags
+        """
         beta, chi_b = param.unpack(theta)
         p.update_specifications(
             {"beta_annual": beta.tolist(), "chi_b": chi_b.tolist()}
@@ -843,32 +1216,75 @@ def calibrate_beta_chi_b(
         )
 
     def residuals(theta):
+        """
+        Weighted log residuals at ``theta``, with a penalty on failed solves.
+
+        Args:
+            theta (Numpy array): free parameters
+
+        Returns:
+            res (Numpy array): one clipped residual per target
+        """
+        theta = np.asarray(theta, dtype=float)
+        cached = state.get("cache")
+        if cached is not None and np.array_equal(cached[0], theta):
+            return cached[1].copy()
         updated, solution = _solve(theta)
         if not solution.all_converged:
             logger.warning(
                 "Household solve failed at theta=%s; penalizing.",
                 np.round(theta, 4).tolist(),
             )
-            return np.full(len(names), options.failure_residual)
-        state["b_guess"], state["n_guess"] = solution.b_sp1, solution.n
-        model_values = _preference_model_values(
-            updated, p, config, options, selection
-        )
-        state["last"] = (updated, solution, model_values)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            res = weights * np.log(model_values / data_values)
-        if not np.all(np.isfinite(res)):
-            return np.full(len(names), options.failure_residual)
-        return np.clip(
-            res, -options.failure_residual, options.failure_residual
-        )
+            res = np.full(len(names), options.failure_residual)
+        else:
+            state["b_guess"], state["n_guess"] = solution.b_sp1, solution.n
+            model_values = _preference_model_values(
+                updated, p, config, options, selection
+            )
+            state["last"] = (updated, solution, model_values)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                res = weights * np.log(model_values / data_values)
+            if not np.all(np.isfinite(res)):
+                res = np.full(len(names), options.failure_residual)
+            res = np.clip(
+                res, -options.failure_residual, options.failure_residual
+            )
+        state["cache"] = (theta.copy(), res.copy())
+        return res
+
+    def jacobian(theta):
+        """
+        Forward-difference Jacobian with an absolute step from one guess.
+
+        Args:
+            theta (Numpy array): free parameters
+
+        Returns:
+            J (Numpy array): derivatives of the residuals, shape (targets,
+                free parameters)
+        """
+        theta = np.asarray(theta, dtype=float)
+        f0 = residuals(theta)
+        b0, n0, last0 = state["b_guess"], state["n_guess"], state["last"]
+        J = np.empty((len(names), theta.size))
+        for k in range(theta.size):
+            h = float(options.diff_step)
+            if theta[k] + h > param.upper[k]:
+                h = -h
+            shifted = theta.copy()
+            shifted[k] += h
+            state["b_guess"], state["n_guess"] = b0, n0
+            J[:, k] = (residuals(shifted) - f0) / h
+        state["b_guess"], state["n_guess"], state["last"] = b0, n0, last0
+        state["cache"] = (theta.copy(), f0.copy())
+        return J
 
     result = optimize.least_squares(
         residuals,
         theta0,
+        jac=jacobian,
         bounds=(param.lower, param.upper),
         method="trf",
-        diff_step=options.diff_step,
         max_nfev=options.max_nfev,
         ftol=options.ftol,
         xtol=options.xtol,
@@ -900,6 +1316,8 @@ def calibrate_beta_chi_b(
         message=str(result.message),
         ss_output=updated,
         solution=solution,
+        jacobian=np.asarray(result.jac, dtype=float),
+        weights=weights,
     )
 
 
@@ -909,18 +1327,32 @@ def calibrate_beta_chi_b(
 
 
 def _ss_solver_has_G() -> bool:
-    """Whether the installed OG-Core steady-state solver carries G."""
+    """
+    Whether the installed OG-Core steady-state solver carries G.
+
+    Returns:
+        has_G (bool): True when ``SS.SS_solver`` takes a ``G`` argument
+    """
     import inspect
 
     return "G" in inspect.signature(SS.SS_solver).parameters
 
 
 def _ss_guesses_from_solution(previous: dict, p) -> list:
-    """Outer-loop guess vector for ``SS.SS_fsolve`` from a prior solution.
+    """
+    Builds the outer-loop guess vector for ``SS.SS_fsolve`` from a prior
+    solution.
 
     Layout follows ``SS.run_SS`` for a baseline solve: ``[r_p, r, w]``,
     then ``p_m``, ``Y``, the bequest items, ``G`` on OG-Core versions whose
     solver carries it, ``TR``, and ``factor``.
+
+    Args:
+        previous (dict): earlier OG-Core steady-state output
+        p (OG-Core Specifications object): parameters object
+
+    Returns:
+        guesses (list): outer-loop guess vector
     """
     BQ = np.atleast_1d(np.asarray(previous["BQ"], dtype=float))
     bq_items = [float(BQ.sum())] if p.use_zeta else BQ.tolist()
@@ -938,7 +1370,18 @@ def _ss_guesses_from_solution(previous: dict, p) -> list:
 
 
 def _unpack_ss_solution(x: np.ndarray, p) -> dict:
-    """Split the root-finder solution into named outer-loop variables."""
+    """
+    Splits the root-finder solution into named outer-loop variables.
+
+    Args:
+        x (Numpy array): solution vector in the layout of
+            ``_ss_guesses_from_solution``
+        p (OG-Core Specifications object): parameters object
+
+    Returns:
+        vals (dict): ``r_p``, ``r``, ``w``, ``p_m``, ``Y``, ``BQ``, ``TR``,
+            ``factor``, and ``G`` when the solver carries it
+    """
     x = np.asarray(x, dtype=float)
     has_G = _ss_solver_has_G()
     out = {
@@ -962,7 +1405,8 @@ def _unpack_ss_solution(x: np.ndarray, p) -> dict:
 def solve_ge_steady_state(
     p, previous: dict | None = None, client=None
 ) -> dict:
-    """Solve the baseline general-equilibrium steady state.
+    """
+    Solves the baseline general-equilibrium steady state.
 
     With ``previous`` (an earlier OG-Core steady-state output), the outer
     root finder starts from that solution's prices, aggregates, and
@@ -972,6 +1416,16 @@ def solve_ge_steady_state(
     ``SS.run_SS``.  Serial solves (``client=None``) are much faster than
     Dask on a single machine because the steady state is dominated by
     parameter-scattering overhead.
+
+    Args:
+        p (OG-Core Specifications object): parameters object with
+            ``baseline=True``
+        previous (dict): earlier steady-state output for the warm start;
+            None for a cold solve
+        client (Dask Client object): client
+
+    Returns:
+        ss_output (dict): OG-Core steady-state output
     """
     from scipy import optimize
 
@@ -1042,7 +1496,24 @@ _WARM_START_ERRORS = (
 
 @dataclass
 class OuterIterationRecord:
-    """Diagnostics for one pass of the outer calibration loop."""
+    """
+    Diagnostics for one pass of the outer calibration loop.
+
+    Attributes:
+        iteration (int): pass number, starting at 1
+        param_change (float): largest absolute change in the transformed
+            parameters over the pass
+        price_change (float): largest relative change in the outer-loop
+            prices after the GE re-solve
+        damping (float): damping factor applied to the parameter update
+        chi_n_iterations (int): steps taken by the last chi_n inversion
+        pref_nfev (int): household solves used by the beta / chi_b step
+        pref_cost (float): least-squares cost of the beta / chi_b step
+        ge_seconds (float): wall time of the GE re-solve
+        prices (dict): ``r_p``, ``r``, ``w``, ``factor``, ``TR`` after the
+            re-solve
+        residuals (dict): relative moment residuals by moment name
+    """
 
     iteration: int
     param_change: float
@@ -1058,7 +1529,23 @@ class OuterIterationRecord:
 
 @dataclass
 class LifecycleCalibrationOutcome:
-    """Result of the full nested preference calibration."""
+    """
+    Result of the full nested preference calibration.
+
+    Attributes:
+        beta_annual (Numpy array): calibrated beta by type, length J
+        chi_b (Numpy array): calibrated chi_b by type, length J
+        chi_n (Numpy array): calibrated steady-state chi_n by age, length S
+        ss_output (dict): final general-equilibrium steady state
+        iterations (int): number of outer passes taken
+        converged (bool): whether parameters and prices met the tolerances
+        history (list): one OuterIterationRecord per pass
+        data_moments (MomentSet): data moments
+        model_moments (MomentSet): model moments at the final steady state
+        chi_n_result (ChiNInversionResult or None): last chi_n inversion
+        pref_result (PreferenceCalibrationResult or None): last beta /
+            chi_b calibration
+    """
 
     beta_annual: np.ndarray
     chi_b: np.ndarray
@@ -1074,7 +1561,12 @@ class LifecycleCalibrationOutcome:
 
     @property
     def parameter_dict(self) -> dict:
-        """Calibrated values in ``update_specifications`` format."""
+        """
+        Calibrated values in ``update_specifications`` format.
+
+        Returns:
+            params (dict): ``beta_annual``, ``chi_b``, ``chi_n`` as lists
+        """
         return {
             "beta_annual": np.asarray(self.beta_annual).tolist(),
             "chi_b": np.asarray(self.chi_b).tolist(),
@@ -1082,12 +1574,26 @@ class LifecycleCalibrationOutcome:
         }
 
     def to_frame(self):
-        """Data versus model moments at the final general equilibrium."""
+        """
+        Tabulates data versus model moments at the final general equilibrium.
+
+        Returns:
+            frame (Pandas DataFrame): columns ``moment``, ``data``, ``model``
+        """
         return self.data_moments.to_frame(self.model_moments)
 
 
 def _theta_from_p(p) -> np.ndarray:
-    """Stack transformed preference parameters for change tracking."""
+    """
+    Stacks the transformed preference parameters for change tracking.
+
+    Args:
+        p (OG-Core Specifications object): parameters object
+
+    Returns:
+        theta (Numpy array): ``logit(beta_annual)``, ``log(chi_b)``, and
+            ``log(chi_n)`` stacked, length 2J + S
+    """
     from ogusa import estimate_lifecycle_params as elp
 
     beta = np.asarray(p.beta_annual, dtype=float)
@@ -1101,7 +1607,17 @@ def _theta_from_p(p) -> np.ndarray:
 
 
 def _apply_theta(theta: np.ndarray, p) -> None:
-    """Inverse of :func:`_theta_from_p`, applied to the spec."""
+    """
+    Applies a stacked transformed parameter vector to the parameters
+    object; the inverse of ``_theta_from_p``.
+
+    Args:
+        theta (Numpy array): stacked transformed parameters, length 2J + S
+        p (OG-Core Specifications object): parameters object; updated in place
+
+    Returns:
+        None
+    """
     J = p.J
     beta = _logistic(theta[:J])
     chi_b = np.exp(theta[J : 2 * J])
@@ -1116,7 +1632,18 @@ def _apply_theta(theta: np.ndarray, p) -> None:
 
 
 def _price_change(new: dict, old: dict) -> tuple[float, dict]:
-    """Largest relative change across the outer-loop prices."""
+    """
+    Computes the largest relative change across the outer-loop prices.
+
+    Args:
+        new (dict): steady-state output after the re-solve
+        old (dict): steady-state output before the re-solve
+
+    Returns:
+        max_change (float): largest relative change
+        changes (dict): relative change for ``r_p``, ``r``, ``w``,
+            ``factor``, ``TR``, and total ``BQ``
+    """
     keys = ("r_p", "r", "w", "factor", "TR")
     changes = {}
     for key in keys:
@@ -1143,7 +1670,9 @@ def calibrate_lifecycle_preferences(
     client=None,
     ge_client=None,
 ) -> LifecycleCalibrationOutcome:
-    """Calibrate chi_n, beta by type, and chi_b to joint GE convergence.
+    """
+    Calibrates chi_n, beta by type, and chi_b to joint general-equilibrium
+    convergence.
 
     Each outer pass: solve (or reuse) the general-equilibrium steady state,
     invert the labor FOC for ``chi_n`` at those prices, calibrate ``beta``
@@ -1160,12 +1689,40 @@ def calibrate_lifecycle_preferences(
 
     With ``adaptive_damping`` the damping factor halves whenever the
     parameter change fails to shrink by at least ten percent from one pass
-    to the next, which guards against
-    the oscillation that strong general-equilibrium feedback (saving down,
-    interest rate up, hours up) can produce.
+    to the next, which guards against the oscillation that strong
+    general-equilibrium feedback (saving down, interest rate up, hours up)
+    can produce.
 
-    On return ``p`` carries the calibrated parameters and the outcome holds
-    the final steady state and a data-versus-model moment table.
+    On return ``p`` carries the calibrated parameters.
+
+    Args:
+        p (OG-Core Specifications object): parameters object with
+            ``baseline=True``; updated in place
+        config (LifecycleCalibrationConfig): moment configuration; default
+            configuration when None
+        options (PreferenceCalibrationOptions): beta / chi_b options;
+            defaults when None
+        data_moments (MomentSet): data moments; computed from the
+            configuration when None
+        initial_ss (dict): steady-state output to start from; solved cold
+            when None
+        max_outer (int): maximum number of outer passes
+        param_tol (float): tolerance on the largest transformed-parameter
+            change
+        price_tol (float): tolerance on the largest relative price change
+        outer_damping (float): initial damping on the parameter update
+        adaptive_damping (bool): whether to halve the damping when the
+            parameter change stalls
+        reinvert_chi_n (bool): whether to re-invert chi_n after the beta /
+            chi_b step
+        client (Dask Client object): client for household solves
+        ge_client (Dask Client object): client for the GE solves; serial
+            when None
+
+    Returns:
+        outcome (LifecycleCalibrationOutcome): calibrated parameters, final
+            steady state, per-pass diagnostics, and data-versus-model
+            moments
     """
     import time
 
@@ -1296,4 +1853,261 @@ def calibrate_lifecycle_preferences(
         model_moments=model_moments,
         chi_n_result=chi_n_result,
         pref_result=pref_result,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: inference on beta and chi_b at the calibrated point
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PreferenceInference:
+    """
+    Standard errors and overidentification test for beta and chi_b.
+
+    Attributes:
+        theta_se (Numpy array): standard errors of the free (transformed)
+            parameters, in the order of ``_PreferenceParameterization``:
+            beta groups (logit shifts) then chi_b groups (log shifts); NaN
+            for parameters fixed at a bound
+        beta_se (Numpy array): delta-method standard errors of beta by
+            type, length J; NaN at a bound
+        chi_b_se (Numpy array): delta-method standard errors of chi_b by
+            type, length J; NaN at a bound
+        vcv_theta (Numpy array): covariance matrix of the free parameters;
+            NaN rows and columns for parameters at a bound
+        j_stat (float): Hansen-type test statistic of the overidentifying
+            restrictions, or NaN when no moment covariance was supplied
+        j_df (int): degrees of freedom of the test, targets minus free
+            parameters
+        j_pvalue (float): p-value of the test, or NaN
+        method (str): ``"nls"`` (homoskedastic residual variance) or
+            ``"sandwich"`` (supplied moment covariance)
+        n_moments (int): number of targets
+        n_params (int): number of free parameters not at a bound
+        at_bound (Numpy array): whether each free parameter sits at a
+            bound, boolean
+    """
+
+    theta_se: np.ndarray
+    beta_se: np.ndarray
+    chi_b_se: np.ndarray
+    vcv_theta: np.ndarray
+    j_stat: float
+    j_df: int
+    j_pvalue: float
+    method: str
+    n_moments: int
+    n_params: int
+    at_bound: np.ndarray
+
+    def to_frame(self, p):
+        """
+        Tabulates point estimates and standard errors by type.
+
+        Args:
+            p (OG-Core Specifications object): parameters object carrying
+                the calibrated values
+
+        Returns:
+            frame (Pandas DataFrame): columns ``type``, ``beta_annual``,
+                ``beta_se``, ``beta_at_bound``, ``chi_b``, ``chi_b_se``,
+                ``chi_b_at_bound``; a standard error is NaN for a type whose
+                parameter sits on a bound
+        """
+        import pandas as pd
+
+        return pd.DataFrame(
+            {
+                "type": np.arange(1, p.J + 1),
+                "beta_annual": np.asarray(p.beta_annual, dtype=float),
+                "beta_se": self.beta_se,
+                "beta_at_bound": np.isnan(self.beta_se),
+                "chi_b": np.asarray(p.chi_b, dtype=float),
+                "chi_b_se": self.chi_b_se,
+                "chi_b_at_bound": np.isnan(self.chi_b_se),
+            }
+        )
+
+
+def preference_target_selection(
+    data_moments, p, config, options: PreferenceCalibrationOptions
+) -> np.ndarray:
+    """
+    Builds the matrix mapping the full moment vector to the beta / chi_b
+    targets.
+
+    Rows follow ``preference_targets``; merged wealth-share bins sum the
+    underlying per-type shares.  ``A @ data_moments.values`` reproduces the
+    target values, and ``A @ V @ A.T`` carries a bootstrap covariance of the
+    full moment set over to the targets.
+
+    Args:
+        data_moments (MomentSet): full data moment vector
+        p (OG-Core Specifications object): parameters object
+        config (LifecycleCalibrationConfig): moment configuration
+        options (PreferenceCalibrationOptions): grouping options
+
+    Returns:
+        A (Numpy array): selection matrix, shape (targets, moments)
+    """
+    from ogusa import estimate_lifecycle_params as elp
+
+    names, values, selection = preference_targets(
+        data_moments, p, config, options
+    )
+    index = {name: k for k, name in enumerate(data_moments.names)}
+    share_names = elp.wealth_share_bin_names(elp._lambdas(p))
+    A = np.zeros((len(names), len(data_moments.names)))
+    row = 0
+    for members in selection["share_bins"]:
+        for j in members:
+            A[row, index[share_names[j]]] = 1.0
+        row += 1
+    A[row, index["wealth_income_ratio"]] = 1.0
+    row += 1
+    if options.chi_b_mode == "by_type":
+        tilt_names = elp.tilt_moment_names(config, p)
+        for k in selection["tilt_idx"]:
+            A[row, index[tilt_names[k]]] = 1.0
+            row += 1
+    A[row, index["bequest_flow_ratio"]] = 1.0
+    assert row + 1 == len(names)
+    if not np.allclose(A @ data_moments.values, values):
+        raise RuntimeError("Selection matrix does not reproduce targets.")
+    return A
+
+
+def preference_inference(
+    result: PreferenceCalibrationResult,
+    p,
+    options: PreferenceCalibrationOptions | None = None,
+    moment_vcv: np.ndarray | None = None,
+    bound_tol: float = 1e-6,
+) -> PreferenceInference:
+    """
+    Computes standard errors for beta and chi_b from the least-squares
+    Jacobian.
+
+    The calibration minimizes the sum of squared weighted log residuals
+    ``r(theta) = w * (log m(theta) - log d)`` over household-only solves,
+    so it is a GMM estimator with an identity weighting matrix on the
+    weighted log moments.  With ``G`` the Jacobian of ``r`` at the solution
+    the parameter covariance is
+
+    * ``s^2 (G'G)^-1`` with ``s^2 = r'r / (m - k)`` when no moment
+      covariance is given (classical nonlinear least squares; treats every
+      target as equally noisy), or
+    * ``(G'G)^-1 G' V_r G (G'G)^-1`` with ``V_r = D V_d D`` when
+      ``moment_vcv`` (the covariance ``V_d`` of the data targets in levels,
+      for example from ``estimate_lifecycle_params.bootstrap_data_moments``
+      carried through ``preference_target_selection``) is given, where
+      ``D = diag(w / d)`` converts to weighted log units.  In that case the
+      overidentification statistic ``r' (M V_r M')^+ r`` with
+      ``M = I - G (G'G)^-1 G'`` is chi-squared with ``m - k`` degrees of
+      freedom under the null that the model matches every target.
+
+    Parameters live in the transformed space of the calibration (shifts to
+    ``logit(beta)`` per beta group and ``log(chi_b)`` per chi_b group);
+    standard errors for ``beta_annual`` and ``chi_b`` by type follow from
+    the delta method.
+
+    A parameter within ``bound_tol`` of one of its bounds (in the
+    transformed space) is treated as fixed there: its column is dropped
+    from the Jacobian, it does not count toward ``k``, and its standard
+    error is NaN.  The types at the ``beta_annual`` ceiling are the usual
+    case; their logit derivative is essentially zero and a delta-method
+    standard error would be meaningless.
+
+    Args:
+        result (PreferenceCalibrationResult): calibration result carrying
+            the Jacobian, residuals, weights, and data values
+        p (OG-Core Specifications object): parameters object carrying
+            the calibrated parameters that ``result`` was computed at
+        options (PreferenceCalibrationOptions): grouping options used in
+            the calibration; defaults when None
+        moment_vcv (Numpy array or None): covariance of the data targets
+            in levels, shape (targets, targets); None for the classical
+            form
+        bound_tol (float): distance from a bound below which a parameter is
+            treated as fixed
+
+    Returns:
+        inference (PreferenceInference): standard errors, covariance, and
+            the overidentification test
+    """
+    from scipy import stats
+
+    if options is None:
+        options = PreferenceCalibrationOptions()
+    if result.jacobian is None:
+        raise ValueError(
+            "result has no Jacobian; re-run calibrate_beta_chi_b."
+        )
+    param = _PreferenceParameterization(p, options)
+    theta = np.asarray(result.theta, dtype=float)
+    at_bound = (theta - param.lower <= bound_tol) | (
+        param.upper - theta <= bound_tol
+    )
+    G_full = np.asarray(result.jacobian, dtype=float)
+    r = np.asarray(result.residuals, dtype=float)
+    m = G_full.shape[0]
+    free = np.flatnonzero(~at_bound)
+    G = G_full[:, free]
+    k = free.size
+    if m <= k:
+        raise ValueError("Need more targets than free parameters.")
+    GtG_inv = np.linalg.pinv(G.T @ G)
+    if moment_vcv is None:
+        s2 = float(r @ r) / (m - k)
+        vcv = s2 * GtG_inv
+        j_stat = j_pvalue = np.nan
+        method = "nls"
+    else:
+        V_d = np.asarray(moment_vcv, dtype=float)
+        if V_d.shape != (m, m):
+            raise ValueError(
+                f"moment_vcv must be {(m, m)} to match the targets."
+            )
+        weights = (
+            np.ones(m)
+            if result.weights is None
+            else np.asarray(result.weights)
+        )
+        D = np.diag(weights / np.asarray(result.data_values, dtype=float))
+        V_r = D @ V_d @ D
+        bread = GtG_inv @ G.T
+        vcv = bread @ V_r @ bread.T
+        M = np.eye(m) - G @ bread
+        j_stat = float(r @ np.linalg.pinv(M @ V_r @ M.T) @ r)
+        j_pvalue = float(stats.chi2.sf(j_stat, m - k))
+        method = "sandwich"
+    theta_se = np.full(theta.size, np.nan)
+    theta_se[free] = np.sqrt(np.clip(np.diag(vcv), 0.0, None))
+    vcv_full = np.full((theta.size, theta.size), np.nan)
+    vcv_full[np.ix_(free, free)] = vcv
+    vcv = vcv_full
+
+    beta = np.asarray(p.beta_annual, dtype=float)
+    chi_b = np.asarray(p.chi_b, dtype=float)
+    beta_se = np.zeros(p.J)
+    chi_b_se = np.zeros(p.J)
+    for g, members in enumerate(param.beta_groups):
+        # d beta / d theta = beta (1 - beta) for a logit shift.
+        beta_se[members] = beta[members] * (1 - beta[members]) * theta_se[g]
+    for g, members in enumerate(param.chi_b_groups):
+        chi_b_se[members] = chi_b[members] * theta_se[param.n_beta + g]
+    return PreferenceInference(
+        theta_se=theta_se,
+        beta_se=beta_se,
+        chi_b_se=chi_b_se,
+        vcv_theta=vcv,
+        j_stat=j_stat,
+        j_df=m - k,
+        j_pvalue=j_pvalue,
+        method=method,
+        n_moments=m,
+        n_params=k,
+        at_bound=at_bound,
     )
