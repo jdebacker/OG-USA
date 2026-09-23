@@ -6,10 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-## [Unreleased]
+## [0.6.0] - 2026-09-23 09:00:00
 
 ### Added
 
+- `Calibration(estimate_lifecycle_prefs=True)` runs the nested lifecycle preference calibration on a copy of the parameters that already carries the class's other outputs (tax functions, `e`, `eta`, `zeta`, demographics, macro parameters) and returns `beta_annual`, `chi_b`, and `chi_n` from `get_dict()`. `lifecycle_params_path` reads a saved JSON when its dimensions match the model and writes the result otherwise; `lifecycle_config`, `lifecycle_options`, `lifecycle_initial_ss`, and `lifecycle_kwargs` pass through to `calibrate_lifecycle_preferences`. `estimate_chi_n` is a deprecated alias.
+- `ogusa/calibrate_lifecycle.py`: `preference_inference` computes standard errors for `beta_annual` and `chi_b` by type from the least-squares Jacobian of the household-only calibration step (classical nonlinear least squares, or a sandwich with a bootstrap covariance of the data moments carried to the targets by `preference_target_selection`) and, with a moment covariance, the overidentification test. `PreferenceCalibrationResult` now stores the Jacobian and target weights.
+- `examples/run_lifecycle_calibration.py` runs the calibration through the `Calibration` class and writes the parameter JSON, moment comparison, outer-loop history, optional standard errors, and the hours, wealth, and `chi_n` comparison figures. `examples/validate_lifecycle_time_path.py` solves a baseline and a reform time path at calibrated parameters and records convergence and Euler errors.
 - `ogusa/calibrate_lifecycle.py`: household-only steady-state solve (`HouseholdEnvironment`, `solve_households`, `partial_equilibrium_ss`) that re-solves every lifetime-income type's Euler equations at fixed prices, transfers, bequests, and scaling factor from an OG-Core steady-state output. It reproduces the general-equilibrium household solution at equilibrium prices in well under a second serially and is the inner loop for the preference-parameter calibration.
 - `ogusa/calibrate_lifecycle.py`: `calibrate_lifecycle_preferences` runs the full nested calibration: general-equilibrium steady state, `chi_n` inversion, `beta` and `chi_b` calibration, re-inversion, and a warm-started general-equilibrium re-solve (`solve_ge_steady_state`), repeated with adaptive damping until parameters and prices settle. Returns a `LifecycleCalibrationOutcome` with per-pass diagnostics and a data-versus-model moment table.
 - `ogusa/calibrate_lifecycle.py`: `calibrate_beta_chi_b` calibrates `beta_annual` by type and `chi_b` by type group at fixed prices with bounded nonlinear least squares over household-only solves, targeting SCF wealth shares by type bin, SCF mean wealth over mean income, by-bin old-age wealth tilts, and the mortality-weighted bequest-flow ratio. `PreferenceCalibrationOptions` selects the `chi_b` grouping and whether the structurally unmatchable bottom-half bin is excluded.
@@ -26,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `calibrate_beta_chi_b` now supplies its own finite-difference Jacobian with an absolute step (`PreferenceCalibrationOptions.diff_step`, now absolute in the transformed space) taken from a common household guess. SciPy's `diff_step` is relative to the parameter value, and because the parameterization starts at zero it silently fell back to a step of about 1.5e-8, far below the reproducibility of the household solve, so the least-squares Jacobian was mostly solver noise.
+- `Calibration.get_dict` referenced attributes that were never set for `estimate_beta` and `estimate_chi_n`; the legacy `estimate_beta` path now passes the current `beta_annual` as the initial guess and returns the estimate.
 - `wealth.compute_wealth_moments` no longer drops the wealthiest observation from the top percentile bin, so shares sum to one.
 - Wealth-by-age model moments map age `a` to `b_sp1[a - starting_age - 1]`, the savings actually held at age `a`.
 - DFO-LS bounds in `estimate_lifecycle_params` are built in the transformed (logit/log) parameter space from the ParamTools validators intersected with configurable bounds; the previous code raised on scalar concatenation.
